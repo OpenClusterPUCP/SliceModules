@@ -12,11 +12,9 @@
 # |    - Estructura de directorios y archivos de datos
 # |    - Configuración de nodos (workers y OFS)
 # |    - Recursos disponibles (imágenes y flavors)
-# |    - Por implementar el uso de BD
 # |
 # | 2. GESTORES/MÓDULOS PRINCIPALES
 # |    - SSHManager: Conexiones SSH a nodos
-# |    - WorkerAssigner: Asignación de VMs a workers
 # |    - ImageManager: Sincronización de imágenes
 # |    - SliceManager: Gestión principal de slices
 # |
@@ -37,9 +35,7 @@
 # |    - /deploy-slice: Despliegue de nuevos slices
 # |    - /stop-slice, /restart-slice: Control de slices
 # |    - /pause-vm, /resume-vm, /restart-vm: Control de VMs
-# |    - /vm-vnc, /vm-token: Acceso VNC
-# |    - /slice/[id], /vm/[id]: Información y estado
-# |    - /sync-images: Sincronización de imágenes
+# |    - /sync-images: Sincronización de imágenes a todos los workers
 # |
 # | 6. UTILIDADES
 # |    - Manejo de archivos JSON
@@ -88,22 +84,11 @@ WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
 # Estructura de directorios
 DATA_DIR = {
     'root': os.path.join(WORKING_DIR, 'data'),
-    'slices': os.path.join(WORKING_DIR, 'data', 'slices'),
-    'network': os.path.join(WORKING_DIR, 'data', 'network'),
     'dhcp': {
         'config': os.path.join(WORKING_DIR, 'data', 'dhcp', 'config'),
         'log': os.path.join(WORKING_DIR, 'data', 'dhcp', 'log')
     },
     'images': os.path.join(WORKING_DIR, 'images'),
-    'test': os.path.join(WORKING_DIR, 'test_data')
-}
-
-# Archivos de datos
-DATA_FILES = {
-    'slices': os.path.join(DATA_DIR['slices'], 'slices.json'),
-    'networks': os.path.join(DATA_DIR['network'], 'networks.json'),
-    'vnc_ports': os.path.join(DATA_DIR['root'], 'vnc_ports.json'),
-    'vnc_tokens': os.path.join(DATA_DIR['root'], 'vnc_tokens.json')
 }
 
 # Configuración de nodos
@@ -136,54 +121,14 @@ NODES = {
 
 # Configuración de red
 NETWORK_CONFIG = {
-    'svlan_range': range(1, 4000),
-    'slice_network_prefix': '10.69',
     'dhcp_ns_name': 'ns-internet',
-    'main_bridge': 'br-int',
-    'tap_prefix': 'tap'
-}
-
-# Recursos disponibles
-AVAILABLE_IMAGES = [
-    {
-        "id": "img-cirros",
-        "name": "CirrOS",
-        "path": os.path.join(DATA_DIR['images'], "cirros-0.5.1-x86_64-disk.qcow2")
-    },
-    {
-        "id": "img-ubuntu-noble",
-        "name": "Ubuntu Noble",
-        "path": os.path.join(DATA_DIR['images'], "focal-server-cloudimg-amd64.img")
-    },
-    {
-        "id": "img-alpine",
-        "name": "Alpine Linux",
-        "path": os.path.join(DATA_DIR['images'], "alpine-virt.qcow2")
-    },
-    {
-        "id": "img-lubuntu",
-        "name": "Lubuntu Desktop",
-        "path": os.path.join(DATA_DIR['images'], "lubuntu-20.04.5-desktop-amd64.qcow2")
-    }
-]
-
-AVAILABLE_FLAVORS = [
-    {"id": "flavor-nano", "name": "nano", "ram": 128, "vcpus": 1, "disk": 0.5},
-    {"id": "flavor-micro", "name": "micro", "ram": 256, "vcpus": 1, "disk": 1},
-    {"id": "flavor-small","name": "small","ram": 512,"vcpus": 2,"disk": 2.5},
-    {"id": "flavor-medium","name": "medium","ram": 1024,"vcpus": 2,"disk": 3}
-    # RAM en MB, vCPUs en #, disco en GB
-]
-
-# Configuración VNC
-VNC_CONFIG = {
-    'port_start': 5901,
-    'port_end': 7000
+    'internet_interface': 'ens3',
+    'headnode_br': 'br-int',
 }
 
 
 # ===================== UTILIDADES =====================
-# Funciones auxiliares para manejo de archivos, directorios, logs e IDs
+# Funciones auxiliares para manejo de archivos, directorios y logs
 
 def init_directories() -> bool:
     """
@@ -280,97 +225,6 @@ def save_json_file(file_path: str, content: dict) -> bool:
         Logger.debug(f"Contenido que se intentó guardar: {json.dumps(content, indent=2)}")
         return False
 
-def generate_next_id(file_path: str, key: str) -> int:
-    """
-    Genera un nuevo ID secuencial basado en IDs existentes en un archivo JSON.
-    
-    Args:
-        file_path: Ruta del archivo JSON que contiene los IDs
-        key: Clave del array donde buscar los IDs existentes
-
-    Returns:
-        int: Siguiente ID disponible (máximo existente + 1)
-    """
-    try:
-        Logger.debug(f"Generando siguiente ID para {key} en {file_path}")
-        
-        data = load_json_file(file_path)
-        existing_ids = [int(item["id"]) for item in data.get(key, [])]
-        
-        next_id = max(existing_ids or [0]) + 1
-        Logger.debug(f"IDs existentes: {existing_ids}")
-        Logger.debug(f"Siguiente ID: {next_id}")
-        
-        return next_id
-        
-    except Exception as e:
-        Logger.warning(f"Error generando ID, usando 1 como valor por defecto: {str(e)}")
-        return 1
-
-def init_data_files():
-    """
-    Inicializa los archivos de datos necesarios con estructuras básicas.
-    
-    Crea los siguientes archivos si no existen:
-    - slices.json: Lista de slices desplegados
-    - networks.json: Configuración de redes
-    - vnc_ports.json: Asignación de puertos VNC
-    """
-    Logger.section("INICIALIZANDO ARCHIVOS DE DATOS")
-    
-    default_structures = {
-        DATA_FILES['slices']: {'slices': []},
-        DATA_FILES['networks']: {'networks': []},
-        DATA_FILES['vnc_ports']: {'ports': {}}
-    }
-
-    for file_name, (file_path, default_content) in zip(
-        ["Slices", "Networks", "VNC Ports"],
-        default_structures.items()
-    ):
-        Logger.info(f"Verificando archivo {file_name}...")
-        if not os.path.exists(file_path):
-            Logger.debug(f"Creando {file_name} con estructura por defecto")
-            save_json_file(file_path, default_content)
-        else:
-            Logger.debug(f"Archivo {file_name} ya existe")
-
-    Logger.success("Inicialización de archivos completada")
-
-def get_slice_id_for_vm(vm_id: int) -> int:
-    """
-    Obtiene el ID del slice al que pertenece una VM específica.
-    
-    Args:
-        vm_id: ID de la VM a buscar
-
-    Returns:
-        int: ID del slice al que pertenece la VM
-
-    Raises:
-        Exception: Si la VM no se encuentra en ningún slice
-    """
-    try:
-        Logger.debug(f"Buscando slice para VM {vm_id}")
-        slices_data = load_json_file(DATA_FILES['slices'])
-        
-        for slice_data in slices_data.get('slices', []):
-            slice_id = slice_data['slice_info']['id']
-            Logger.debug(f"Revisando slice {slice_id}")
-            
-            for vm in slice_data['topology_info']['vms']:
-                if vm['id'] == vm_id:
-                    Logger.debug(f"VM {vm_id} encontrada en slice {slice_id}")
-                    return slice_id
-        
-        Logger.error(f"VM {vm_id} no encontrada en ningún slice")
-        raise Exception(f"VM {vm_id} no encontrada en ningún slice")
-        
-    except Exception as e:
-        Logger.error(f"Error buscando slice para VM {vm_id}: {str(e)}")
-        Logger.debug(f"Traceback: {traceback.format_exc()}")
-        raise
-
 class Logger:
     """Clase para manejar el formato y presentación de logs del sistema"""
 
@@ -460,7 +314,7 @@ class Logger:
 
 
 # ===================== SUBMÓDULOS =====================
-# Clases y funciones que permiten controlar el ciclo de vida de las VMs y slices
+# Clases y funciones que permiten controlar el ciclo de vida de las VMs y slices en Linux Clúster
 
 class SSHManager:
     """
@@ -608,56 +462,6 @@ class SSHManager:
             Logger.debug(f"Traceback: {traceback.format_exc()}")
             raise Exception(error_msg)
 
-class WorkerAssigner:
-    """
-    Implementa diferentes estrategias de asignación de VMs a workers.
-    
-    Esta clase proporciona métodos estáticos para asignar VMs a workers del clúster
-    usando diferentes algoritmos de distribución, como:
-    - Round-robin: Distribución circular secuencial
-    - (Futuros algoritmos: carga, recursos disponibles, etc.)
-    """
-    
-    @staticmethod
-    def round_robin(vms: list, workers: list) -> dict:
-        """
-        Asigna VMs a workers usando el algoritmo round-robin (distribución circular).
-        
-        Esta estrategia asigna las VMs de manera secuencial a los workers disponibles,
-        volviendo al primer worker cuando se llega al último. Garantiza una
-        distribución uniforme cuando las VMs tienen requerimientos similares.
-        
-        Args:
-            vms (list): Lista de diccionarios con información de las VMs a asignar.
-                Cada VM debe tener al menos un campo 'id'.
-            workers (list): Lista de nombres/identificadores de workers disponibles.
-            
-        Returns:
-            dict: Diccionario que mapea IDs de VM a nombres de workers asignados.
-                Formato: {vm_id: worker_name, ...}
-                
-        Example:
-            >>> assigner = WorkerAssigner()
-            >>> vms = [{'id': 1}, {'id': 2}, {'id': 3}]
-            >>> workers = ['worker1', 'worker2']
-            >>> assigner.round_robin(vms, workers)
-            {1: 'worker1', 2: 'worker2', 3: 'worker1'}
-        """
-        Logger.subsection("ASIGNANDO VMS A WORKERS (Round-Robin)")
-        Logger.info(f"VMs a asignar: {len(vms)}")
-        Logger.info(f"Workers disponibles: {len(workers)}")
-        Logger.debug(f"IDs de VMs: {[vm['id'] for vm in vms]}")
-        Logger.debug(f"Workers: {workers}")
-
-        assignments = {}
-        for i, vm in enumerate(vms):
-            worker = workers[i % len(workers)]
-            assignments[vm['id']] = worker
-            Logger.debug(f"VM {vm['id']} asignada a {worker}")
-
-        Logger.success(f"Asignación completada: {json.dumps(assignments, indent=2)}")
-        return assignments
-
 class SliceManager:
     """
     Administrador principal de slices y recursos distribuidos del sistema.
@@ -675,488 +479,8 @@ class SliceManager:
 
     def __init__(self):
         """Inicializa las dependencias necesarias para gestión de slices."""
-        self.worker_assigner = WorkerAssigner() 
         self.image_manager = ImageManager()
         Logger.debug("SliceManager inicializado con sus dependencias")
-
-    def _get_next_svlan(self) -> int:
-        """
-        Obtiene el siguiente SVLAN ID disponible para un nuevo slice.
-        
-        Busca secuencialmente el primer ID disponible, considerando:
-        - SVLANs ya en uso (activos o detenidos)
-        - Rango válido de SVLANs configurado
-        
-        Returns:
-            int: Siguiente SVLAN ID disponible
-
-        Raises:
-            Exception: Si no hay más SVLANs disponibles en el rango permitido
-        """
-        Logger.debug("Buscando siguiente SVLAN disponible")
-        
-        # Cargar datos necesarios
-        networks = load_json_file(DATA_FILES['networks'])
-        slices_data = load_json_file(DATA_FILES['slices'])
-        
-        # Obtener SVLANs en uso
-        used_svlans = {
-            s['network_config']['svlan_id'] 
-            for s in slices_data.get('slices', [])
-        }
-        Logger.debug(f"SVLANs en uso: {sorted(list(used_svlans))}")
-        
-        # Buscar siguiente disponible
-        svlan = 1
-        while svlan in used_svlans:
-            svlan += 1
-            
-        if svlan > max(NETWORK_CONFIG['svlan_range']):
-            Logger.error(f"No hay SVLANs disponibles (máximo: {max(NETWORK_CONFIG['svlan_range'])})")
-            raise Exception("No hay SVLANs disponibles")
-        
-        Logger.success(f"SVLAN {svlan} disponible para usar")
-        return svlan
-
-    def get_vm_info(self, vm_id: int) -> dict:
-        """
-        Obtiene información detallada de una VM específica.
-        
-        Recopila toda la información disponible de una VM, incluyendo:
-        - Datos básicos (ID, nombre, estado)
-        - Información del slice al que pertenece
-        - Recursos asignados (flavor, imagen)
-        - Ubicación física (worker)
-        - Interfaces de red y sus conexiones
-        - Información VNC
-        
-        Args:
-            vm_id (int): ID de la VM a consultar
-
-        Returns:
-            dict: Diccionario con toda la información de la VM
-
-        Raises:
-            Exception: Si la VM no existe o hay error obteniendo su información
-        """
-        try:
-            Logger.subsection(f"OBTENIENDO INFORMACIÓN DE VM {vm_id}")
-            
-            # Cargar datos necesarios
-            slices_data = load_json_file(DATA_FILES['slices'])
-            vnc_data = load_json_file(DATA_FILES['vnc_ports'])
-            
-            Logger.debug("Buscando VM en slices...")
-            vm_info = None
-            slice_info = None
-            
-            # Buscar VM en todos los slices
-            for slice_data in slices_data.get('slices', []):
-                for vm in slice_data['topology_info']['vms']:
-                    if vm['id'] == vm_id:
-                        Logger.info(f"VM encontrada en slice {slice_data['slice_info']['id']}")
-                        vm_info = vm
-                        slice_info = slice_data['slice_info']
-                        
-                        # Obtener interfaces
-                        Logger.debug("Recopilando interfaces...")
-                        vm_interfaces = [
-                            iface for iface in slice_data['topology_info']['interfaces']
-                            if iface['vm_id'] == vm_id
-                        ]
-                        Logger.debug(f"Encontradas {len(vm_interfaces)} interfaces")
-                        
-                        # Obtener links asociados
-                        for iface in vm_interfaces:
-                            if iface['link_id']:
-                                link = next(
-                                    (l for l in slice_data['topology_info']['links']
-                                    if l['id'] == iface['link_id']),
-                                    None
-                                )
-                                iface['link'] = link
-                        
-                        vm_info['interfaces'] = vm_interfaces
-                        break
-                if vm_info:
-                    break
-                    
-            if not vm_info:
-                Logger.error(f"VM {vm_id} no encontrada en ningún slice")
-                raise Exception(f"VM {vm_id} no encontrada")
-                
-            # Obtener información VNC
-            Logger.debug("Obteniendo información VNC...")
-            vnc_allocation = vnc_data.get('ports', {}).get(str(vm_id))
-            if vnc_allocation:
-                vm_info['vnc'] = {
-                    'port': vnc_allocation['port'],
-                    'display': vnc_allocation['display'],
-                    'worker_ip': NODES[vnc_allocation['worker']]['data_ip']
-                }
-                Logger.debug(f"VNC: Display {vnc_allocation['display']}, "
-                           f"Puerto {vnc_allocation['port']}")
-            
-            # Obtener recursos
-            Logger.debug("Obteniendo información de recursos...")
-            flavor = self.resource_manager.get_flavor_config(vm_info['flavor_id'])
-            image = next(
-                (img for img in AVAILABLE_IMAGES if img['id'] == vm_info['image_id']),
-                None
-            )
-            
-            # Construir respuesta
-            response = {
-                'id': vm_info['id'],
-                'name': vm_info['name'],
-                'status': vm_info['status'],
-                'slice_id': slice_info['id'],
-                'slice_name': slice_info['name'],
-                'resources': {
-                    'flavor': flavor,
-                    'image': image
-                },
-                'location': vm_info['physical_server'],
-                'interfaces': vm_info['interfaces'],
-                'vnc': vm_info.get('vnc'),
-                'qemu_pid': vm_info.get('qemu_pid')
-            }
-            
-            Logger.success(f"Información de VM {vm_id} recopilada exitosamente")
-            return response
-            
-        except Exception as e:
-            Logger.error(f"Error obteniendo información de VM {vm_id}: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            raise Exception(f"Error obteniendo información de VM: {str(e)}")
-        
-    def _assign_cvlans(self, links: list) -> None:
-        """
-        Asigna CVLANs a los enlaces de manera secuencial.
-        
-        Asigna IDs de VLAN cliente (CVLAN) a cada enlace de la topología,
-        comenzando desde 10 e incrementando de 10 en 10 para evitar conflictos.
-        Los CVLANs se usan para aislar el tráfico entre redes virtuales dentro
-        del mismo slice.
-
-        Args:
-            links (list): Lista de enlaces a los que asignar CVLANs
-        """
-        Logger.subsection("ASIGNANDO CVLANs A ENLACES")
-        Logger.info(f"Procesando {len(links)} enlaces")
-        
-        used_cvlans = set()
-        cvlan_base = 10  # Comenzamos desde 10
-        
-        for link in links:
-            # Encontrar siguiente CVLAN disponible
-            while cvlan_base in used_cvlans:
-                cvlan_base += 10  # Incrementamos de 10 en 10
-            
-            link['cvlan_id'] = cvlan_base
-            used_cvlans.add(cvlan_base)
-            cvlan_base += 10
-            Logger.debug(f"Enlace {link.get('name', link['id'])}: CVLAN {cvlan_base-10}")
-        
-        Logger.success("Asignación de CVLANs completada")
-
-    def process_slice_request(self, slice_request: dict) -> dict:
-        """
-        Procesa una solicitud de creación de slice y prepara su configuración.
-        
-        Esta función realiza todo el procesamiento inicial necesario para desplegar
-        un nuevo slice, incluyendo:
-        - Asignación de IDs únicos (slice, VMs, enlaces, interfaces)
-        - Validación de recursos y topología
-        - Configuración de red y DHCP
-        - Asignación de workers a VMs
-        - Generación de direcciones MAC
-        - Asignación de puertos VNC
-        
-        Args:
-            slice_request (dict): Solicitud de creación con la configuración inicial
-            
-        Returns:
-            dict: Configuración procesada y enriquecida lista para despliegue
-            
-        Raises:
-            Exception: Si hay errores en la configuración o recursos solicitados
-        """
-        try:
-            Logger.major_section("PROCESANDO SOLICITUD DE SLICE")
-            
-            # 1. Cargar datos existentes y calcular nuevos IDs
-            Logger.section("FASE 1: CÁLCULO DE IDs")
-            Logger.info("Cargando datos existentes...")
-            slices_data = load_json_file(DATA_FILES['slices'])
-            
-            # Recolectar IDs existentes
-            existing_ids = {
-                'slices': [],
-                'vms': [],
-                'links': [],
-                'interfaces': []
-            }
-
-            for s in slices_data.get('slices', []):
-                existing_ids['slices'].append(s['slice_info']['id'])
-                
-                for vm in s['topology_info']['vms']:
-                    existing_ids['vms'].append(vm['id'])
-                
-                for link in s['topology_info']['links']:
-                    existing_ids['links'].append(link['id'])
-                
-                for interface in s['topology_info']['interfaces']:
-                    existing_ids['interfaces'].append(interface['id'])
-
-            # Calcular siguientes IDs
-            next_ids = {
-                'slice': max(existing_ids['slices'] or [0]) + 1,
-                'vm': max(existing_ids['vms'] or [0]) + 1,
-                'link': max(existing_ids['links'] or [0]) + 1,
-                'interface': max(existing_ids['interfaces'] or [0]) + 1
-            }
-            
-            Logger.debug(f"IDs calculados: {json.dumps(next_ids, indent=2)}")
-
-            # 2. Asignar nuevos IDs
-            Logger.section("FASE 2: ASIGNACIÓN DE IDs")
-            slice_request['slice_info']['id'] = int(next_ids['slice'])
-            
-            # Mapear IDs de VMs
-            Logger.info("Mapeando IDs de VMs...")
-            vm_id_mapping = {}
-            for vm in slice_request['topology_info']['vms']:
-                old_id = str(vm['id'])
-                vm['id'] = next_ids['vm']
-                vm_id_mapping[old_id] = next_ids['vm']
-                next_ids['vm'] += 1
-                Logger.debug(f"VM {old_id} → {vm['id']}")
-            
-            # Mapear IDs de enlaces
-            Logger.info("Mapeando IDs de enlaces...")
-            link_id_mapping = {}
-            for link in slice_request['topology_info']['links']:
-                old_id = str(link['id'])
-                link['id'] = next_ids['link']
-                link_id_mapping[old_id] = next_ids['link']
-                next_ids['link'] += 1
-                Logger.debug(f"Link {old_id} → {link['id']}")
-            
-            # Actualizar referencias en interfaces
-            Logger.info("Actualizando referencias de interfaces...")
-            for interface in slice_request['topology_info']['interfaces']:
-                vm_id = str(interface['vm_id'])
-                link_id = str(interface['link_id']) if interface['link_id'] is not None else None
-                
-                if vm_id in vm_id_mapping:
-                    interface['vm_id'] = vm_id_mapping[vm_id]
-                if link_id and link_id in link_id_mapping:
-                    interface['link_id'] = link_id_mapping[link_id]
-                
-                interface['id'] = next_ids['interface']
-                next_ids['interface'] += 1
-                Logger.debug(f"Interface {interface['id']}: VM={interface['vm_id']}, Link={interface['link_id']}")
-
-            # 3. Generar direcciones MAC
-            Logger.section("FASE 3: GENERACIÓN DE MACs")
-            for interface in slice_request['topology_info']['interfaces']:
-                slice_hex = f"{next_ids['slice']:02x}"
-                if_hex = f"{interface['id']:02x}"
-                vm_hex = f"{interface['vm_id']:02x}"
-                interface['mac_address'] = f"52:54:00:{slice_hex}:{if_hex}:{vm_hex}"
-                Logger.debug(f"Interface {interface['id']}: MAC={interface['mac_address']}")
-
-            # 4. Validaciones
-            Logger.section("FASE 4: VALIDACIONES")
-            
-            # Verificar VMs en topología
-            if not slice_request.get('topology_info', {}).get('vms'):
-                Logger.error("No se encontraron VMs en la topología")
-                raise ValueError("La topología debe contener al menos una VM")
-            
-            # Verificar IDs únicos
-            vm_ids = [vm['id'] for vm in slice_request['topology_info']['vms']]
-            if len(vm_ids) != len(set(vm_ids)):
-                Logger.error("Se encontraron IDs de VM duplicados")
-                raise ValueError("IDs de VMs deben ser únicos")
-            
-            # Validar recursos
-            Logger.info("Validando recursos solicitados...")
-            for vm in slice_request['topology_info']['vms']:
-                self.resource_manager.validate_resources(vm)
-
-            # 5. Configuración de red
-            Logger.section("FASE 5: CONFIGURACIÓN DE RED")
-            
-            # Verificar SVLAN
-            if next_ids['slice'] not in NETWORK_CONFIG['svlan_range']:
-                Logger.error(f"SVLAN {next_ids['slice']} fuera de rango")
-                raise Exception(
-                    f"ID de slice {next_ids['slice']} fuera del rango permitido para SVLANs "
-                    f"({min(NETWORK_CONFIG['svlan_range'])}-{max(NETWORK_CONFIG['svlan_range'])})"
-                )
-
-            # Generar configuración de red
-            svlan = next_ids['slice']
-            network_prefix = f"{NETWORK_CONFIG['slice_network_prefix']}.{svlan}"
-            network_config = {
-                'slice_id': next_ids['slice'],
-                'svlan_id': svlan,
-                'network': f"{network_prefix}.0/24",
-                'dhcp_range': [
-                    f"{network_prefix}.3",
-                    f"{network_prefix}.254"
-                ],
-                'slice_bridge_name': f"br-s{str(next_ids['slice'])}",
-                'patch_ports': {
-                    'slice_side': f"p-s{svlan}-int",
-                    'int_side': f"p-br-s{svlan}"
-                },
-                'dhcp_interface': f"veth-int.{svlan}",
-                'gateway_interface': f"gw-{svlan}"     
-            }
-            Logger.debug(f"Configuración de red generada: {json.dumps(network_config, indent=2)}")
-
-            # 6. Asignación de workers
-            Logger.section("FASE 6: ASIGNACIÓN DE WORKERS")
-            workers = [k for k in NODES.keys() if k != 'ofs']
-            Logger.info(f"Workers disponibles: {workers}")
-            
-            worker_assignments = self.worker_assigner.round_robin(
-                slice_request['topology_info']['vms'],
-                workers
-            )
-            Logger.debug(f"Asignaciones: {json.dumps(worker_assignments, indent=2)}")
-
-            # 7. Actualizar información de VMs
-            Logger.section("FASE 7: ACTUALIZACIÓN DE VMs")
-            for vm in slice_request['topology_info']['vms']:
-                worker = worker_assignments[vm['id']]
-                Logger.info(f"Procesando VM {vm['id']} en {worker}")
-                
-                # Asignar worker y display VNC
-                vnc_info = self.vnc_manager.allocate_port(
-                    slice_request['slice_info']['id'],
-                    vm['id'],
-                    worker
-                )
-                
-                vm.update({
-                    'status': 'preparing',
-                    'physical_server': {
-                        'name': worker,
-                        'id': worker.replace('worker', '')
-                    },
-                    'vnc_display': vnc_info['display']
-                })
-                Logger.debug(f"VM {vm['id']}: Display VNC={vnc_info['display']}")
-
-                # Ordenar interfaces (externas primero)
-                vm_interfaces = [
-                    i for i in slice_request['topology_info']['interfaces']
-                    if i['vm_id'] == vm['id']
-                ]
-                vm_interfaces.sort(key=lambda x: not x['external_access'])
-                
-                # Actualizar lista de interfaces
-                slice_request['topology_info']['interfaces'] = [
-                    i for i in slice_request['topology_info']['interfaces']
-                    if i['vm_id'] != vm['id']
-                ] + vm_interfaces
-                
-                Logger.debug(f"Interfaces ordenadas para VM {vm['id']}")
-
-            # 8. Asignar CVLANs
-            Logger.section("FASE 8: ASIGNACIÓN DE CVLANs")
-            self._assign_cvlans(slice_request['topology_info']['links'])
-
-            # 9. Preparar respuesta
-            Logger.section("COMPLETADO")
-            response = {
-                'slice_info': slice_request['slice_info'],
-                'network_config': network_config,
-                'topology_info': slice_request['topology_info']
-            }
-            
-            Logger.success("Procesamiento de slice completado exitosamente")
-            return response
-
-        except Exception as e:
-            Logger.error(f"Error procesando slice: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            raise Exception(f"Error procesando solicitud de slice: {str(e)}")
-
-    def _parallel_image_transfer(self, worker_images: dict) -> None:
-        """
-        Transfiere imágenes a workers en paralelo usando múltiples hilos SFTP.
-        
-        Coordina la transferencia simultánea de imágenes a múltiples workers usando
-        hilos independientes para cada uno. Maneja la creación de directorios,
-        verificación de imágenes existentes y permisos.
-        
-        Args:
-            worker_images (dict): Mapeo de workers a conjuntos de rutas de imágenes
-                Formato: {worker_name: set(image_paths)}
-                
-        Raises:
-            Exception: Si hay errores en la transferencia a cualquier worker
-        """
-        Logger.section("TRANSFERENCIA PARALELA DE IMÁGENES")
-        transfer_threads = []
-        transfer_errors = {}
-        
-        def transfer_to_worker(worker: str, images: set):
-            try:
-                with SSHManager(worker) as ssh:
-                    Logger.subsection(f"Iniciando transferencia a {worker}")
-                    sftp = ssh.client.open_sftp()
-                    
-                    # Crear y preparar directorio
-                    Logger.info("Configurando directorio de imágenes...")
-                    ssh.execute(f"sudo mkdir -p {DATA_DIR['images']}")
-                    ssh.execute(f"sudo chmod 777 {DATA_DIR['images']}")
-                    
-                    # Transferir imágenes
-                    for image_path in images:
-                        base_name = os.path.basename(image_path)
-                        remote_path = f"{DATA_DIR['images']}/{base_name}"
-                        try:
-                            sftp.stat(remote_path)
-                            Logger.debug(f"Imagen {base_name} ya existe en {worker}")
-                        except FileNotFoundError:
-                            Logger.info(f"Transfiriendo {base_name} a {worker}")
-                            sftp.put(image_path, remote_path)
-                                    
-                    # Limpiar
-                    sftp.close()
-                    ssh.execute(f"sudo chmod 755 {DATA_DIR['images']}")
-                    ssh.execute(f"sudo chown -R ubuntu:ubuntu {DATA_DIR['images']}")
-                    Logger.success(f"Transferencia completada a {worker}")
-                        
-            except Exception as e:
-                error_msg = f"Error en transferencia a {worker}: {str(e)}"
-                Logger.error(error_msg)
-                transfer_errors[worker] = str(e)
-                raise  # Propagar error
-                
-        # Iniciar threads de transferencia
-        Logger.info(f"Iniciando {len(worker_images)} threads de transferencia")
-        for worker, images in worker_images.items():
-            thread = threading.Thread(
-                target=transfer_to_worker,
-                args=(worker, images)
-            )
-            threads.append(thread)
-            thread.start()
-        
-        # Esperar threads
-        for thread in threads:
-            thread.join()
-            
-        if transfer_errors:
-            raise Exception(f"Errores en transferencia de imágenes: {transfer_errors}")
 
     def deploy_slice(self, slice_config: dict) -> dict:
         """
@@ -1199,7 +523,7 @@ class SliceManager:
             vms_by_worker = {}
             try:
                 for vm in slice_config['topology_info']['vms']:
-                    Logger.debug(f"\nProcesando VM: {vm['id']}")
+                    Logger.debug(f"\nProcesando VM: ID-{vm['id']}")
                     worker_id = str(vm['physical_server']['id'])
                     Logger.debug(f"Worker ID: {worker_id}")
                     
@@ -1301,7 +625,7 @@ class SliceManager:
                                     'qemu_pid': vm_data.get('qemu_pid'),
                                     'status': 'running' if vm_data.get('qemu_pid') else 'error'
                                 })
-                                Logger.debug(f"VM {vm['id']} actualizada: "
+                                Logger.debug(f"VM ID-{vm['id']} actualizada: "
                                         f"PID={vm_data.get('qemu_pid')}, "
                                         f"status={'running' if vm_data.get('qemu_pid') else 'error'}")
 
@@ -1336,7 +660,7 @@ class SliceManager:
             errors (dict): Diccionario para almacenar errores
         """
         try:
-            Logger.subsection(f"CONFIGURANDO WORKER {worker_info['name']}")
+            Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
             Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
             Logger.info(f"VMs a configurar: {len(vms)}")
 
@@ -1374,7 +698,7 @@ class SliceManager:
                 # 4. Iniciar VMs
                 vm_results = []
                 for vm in vms:
-                    Logger.info(f"Iniciando VM {vm['id']} en {worker_info['name']}...")
+                    Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
                     self._start_single_vm(ssh, vm, slice_config)
                     
                     # Verificar estado
@@ -1383,7 +707,7 @@ class SliceManager:
                     )
                     if stdout.strip():
                         qemu_pid = int(stdout.split()[0])
-                        Logger.success(f"VM {vm['id']} iniciada con PID {qemu_pid}")
+                        Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
                         vm_results.append({
                             'id': vm['id'],
                             'qemu_pid': qemu_pid,
@@ -1472,14 +796,14 @@ class SliceManager:
         slice_bridge = network_config['slice_bridge_name']
         
         for vm in vms:
-            Logger.debug(f"Procesando interfaces de VM {vm['id']}")
+            Logger.debug(f"Procesando interfaces de VM ID-{vm['id']}")
             vm_interfaces = [i for i in slice_config['topology_info']['interfaces']
                             if i['vm_id'] == vm['id']]
             
             for interface in vm_interfaces:
                 tap_name = interface.get('tap_name')
                 if not tap_name:
-                    Logger.warning(f"Interface sin tap_name para VM {vm['id']}")
+                    Logger.warning(f"Interface sin tap_name para VM ID-{vm['id']}")
                     continue
                 
                 Logger.debug(f"Configurando TAP {tap_name}")
@@ -1542,7 +866,7 @@ class SliceManager:
             Exception: Si hay error iniciando la VM o QEMU no está corriendo
         """
         try:
-            Logger.subsection(f"INICIANDO VM {vm['id']}")
+            Logger.subsection(f"INICIANDO VM ID-{vm['id']}")
             
             # Convertir IDs a string para acceder al diccionario
             flavor_id = str(vm['flavor_id'])
@@ -1607,7 +931,7 @@ class SliceManager:
             # Agregar interfaces en orden
             Logger.info("Configurando interfaces...")
             for interface in vm_interfaces:
-                tap_name = interface['tap_name']  # Usar nombre TAP proporcionado por handle_multi
+                tap_name = interface['tap_name']  # Usar nombre TAP proporcionado
                 cmd.extend([
                     f"-netdev tap,id={tap_name},ifname={tap_name},script=no,downscript=no",
                     f"-device e1000,netdev={tap_name},mac={interface['mac_address']}"
@@ -1632,7 +956,7 @@ class SliceManager:
                 
             # Actualizar PID en la configuración de la VM
             vm['qemu_pid'] = int(stdout.split()[0])
-            Logger.success(f"VM {vm['id']} iniciada con PID {vm['qemu_pid']}")
+            Logger.success(f"VM ID-{vm['id']} iniciada con PID {vm['qemu_pid']}")
             
         except Exception as e:
             Logger.error(f"Error iniciando VM {vm['id']}: {str(e)}")
@@ -1665,7 +989,7 @@ class SliceManager:
             image_info = slice_config['resources_info']['images'][image_id]
             flavor_info = slice_config['resources_info']['flavors'][flavor_id]
             
-            Logger.debug(f"VM {vm['id']}: Imagen {image_id}, Flavor {flavor_id}")
+            Logger.debug(f"VM ID-{vm['id']}: Imagen {image_id}, Flavor {flavor_id}")
             
             # Generar nombres de archivo
             base_image = os.path.basename(image_info['path'])
@@ -1753,96 +1077,6 @@ class SliceManager:
                 
         Logger.success("Puertos físicos configurados exitosamente")
 
-    def _setup_slice_bridges(self, svlan: int, vms: list, network_config: dict):
-        """
-        Crea y configura bridges específicos para el slice en los workers.
-        
-        Configura para cada worker usado:
-        1. Bridge dedicado para el slice
-        2. Patch ports entre el bridge del slice y br-int
-        3. QinQ tagging en patch ports
-        
-        Args:
-            svlan (int): ID del SVLAN para el slice
-            vms (list): Lista de VMs del slice
-            network_config (dict): Configuración de red del slice
-        """
-        Logger.section(f"CONFIGURANDO BRIDGES DE SLICE (SVLAN {svlan})")
-        
-        workers_used = set(vm['physical_server']['name'] for vm in vms)
-        Logger.info(f"Workers a configurar: {list(workers_used)}")
-        
-        for worker in workers_used:
-            Logger.subsection(f"Configurando worker {worker}")
-            with SSHManager(worker) as ssh:
-                slice_bridge = network_config['slice_bridge_name']
-                patch_slice = network_config['patch_ports']['slice_side']
-                patch_int = network_config['patch_ports']['int_side']
-                
-                Logger.debug(f"Bridge: {slice_bridge}")
-                Logger.debug(f"Patch ports: {patch_slice} <-> {patch_int}")
-
-                # Limpiar configuración anterior
-                Logger.info("Limpiando configuración anterior...")
-                ssh.execute(f"""
-                    sudo ovs-vsctl --if-exists del-port br-int {patch_int}
-                    sudo ovs-vsctl --if-exists del-port {slice_bridge} {patch_slice}
-                    sudo ovs-vsctl --if-exists del-br {slice_bridge}
-                """)
-                
-                # Crear y configurar nuevo bridge
-                Logger.info("Creando nueva configuración...")
-                cmd = f"""
-                sudo ovs-vsctl add-br {slice_bridge}
-                sudo ovs-vsctl add-port {slice_bridge} {patch_slice} -- \
-                    set interface {patch_slice} type=patch options:peer={patch_int}
-                sudo ovs-vsctl add-port br-int {patch_int} -- \
-                    set interface {patch_int} type=patch options:peer={patch_slice} -- \
-                    set port {patch_int} vlan_mode=dot1q-tunnel tag={svlan}
-                """
-                ssh.execute(cmd)
-                Logger.success(f"Bridge {slice_bridge} configurado")
-
-    def _setup_vm_interfaces(self, slice_config: dict):
-        """
-        Configura las interfaces de red para las VMs del slice.
-        
-        Asigna nombres a las interfaces TAP:
-        - Interfaces externas: tapx-VM{vm_id}-S{slice_id}
-        - Interfaces internas: tap-VM{vm_id}-S{slice_id}-{if_num}
-        
-        Args:
-            slice_config (dict): Configuración completa del slice
-        """
-        Logger.section("CONFIGURANDO INTERFACES DE RED")
-        
-        network_config = slice_config['network_config']
-        slice_bridge = network_config['slice_bridge_name']
-        
-        Logger.info("Asignando nombres TAP a interfaces...")
-        for vm in slice_config['topology_info']['vms']:
-            Logger.debug(f"Procesando VM {vm['id']}")
-            
-            vm_interfaces = [
-                i for i in slice_config['topology_info']['interfaces']
-                if i['vm_id'] == vm['id']
-            ]
-            vm_interfaces.sort(key=lambda x: not x['external_access'])
-            
-            internal_if_count = 0
-            for interface in vm_interfaces:
-                if interface['external_access']:
-                    tap_name = f"tapx-VM{vm['id']}-S{slice_config['slice_info']['id']}"
-                    Logger.debug(f"Interface externa: {tap_name}")
-                else:
-                    internal_if_count += 1
-                    tap_name = f"tap-VM{vm['id']}-S{slice_config['slice_info']['id']}-{internal_if_count}"
-                    Logger.debug(f"Interface interna {internal_if_count}: {tap_name}")
-                    
-                interface['tap_name'] = tap_name
-                
-        Logger.success("Interfaces de red configuradas")
-
     def _setup_internet_access(self, network_config: dict):
         """
         Configura acceso a internet y DHCP para el slice.
@@ -1883,10 +1117,11 @@ class SliceManager:
         os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link set veth-int up")
         os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link set lo up")
         os.system("ip link set veth-ext up")
+        os.system(f"ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} veth-ext")
         
         # 3. Conectar a OVS y configurar gateway
         Logger.subsection("CONFIGURANDO OVS Y GATEWAY")
-        os.system(f"ovs-vsctl --may-exist add-port br-int {gateway_if}")
+        os.system(f"ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
         os.system(f"ovs-vsctl set interface {gateway_if} type=internal")
         os.system(f"ovs-vsctl set port {gateway_if} tag={svlan}")
         os.system(f"ip link set {gateway_if} up")
@@ -1900,13 +1135,22 @@ class SliceManager:
         
         # 5. Configurar NAT
         Logger.subsection("CONFIGURANDO NAT Y FORWARDING")
+
+        # nat_commands = [
+        #     f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} iptables -t nat -A POSTROUTING -s {network} -j MASQUERADE",
+        #     f"sudo iptables -A FORWARD -s {network} -j ACCEPT",
+        #     f"sudo iptables -A FORWARD -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+        #     f"sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+        #     "sudo sysctl -w net.ipv4.ip_forward=1"
+        # ]
+
         nat_commands = [
-            f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} iptables -t nat -A POSTROUTING -s {network} -j MASQUERADE",
-            f"sudo iptables -A FORWARD -s {network} -j ACCEPT",
-            f"sudo iptables -A FORWARD -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-            f"sudo iptables -t nat -A POSTROUTING -s {network} -o ens3 -j MASQUERADE",
+            f"iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+            f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+            f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
             "sudo sysctl -w net.ipv4.ip_forward=1"
         ]
+
         
         for cmd in nat_commands:
             Logger.debug(f"Ejecutando: {cmd}")
@@ -2077,7 +1321,7 @@ class SliceManager:
             for vm in vms:
                 worker = vm['physical_server']['name']
                 image_path = self.resource_manager.get_image_path(vm['image_id'])
-                Logger.debug(f"VM {vm['id']}: {image_path} -> {worker}")
+                Logger.debug(f"VM ID-{vm['id']}: {image_path} -> {worker}")
                 
                 worker_images.setdefault(worker, set()).add(image_path)
 
@@ -2114,7 +1358,7 @@ class SliceManager:
             # 3. Crear y configurar VMs
             Logger.section("CONFIGURANDO E INICIANDO VMs")
             for vm in vms:
-                Logger.subsection(f"VM {vm['id']} en {vm['physical_server']['name']}")
+                Logger.subsection(f"VM ID-{vm['id']} en {vm['physical_server']['name']}")
                 worker = vm['physical_server']['name']
                 
                 with SSHManager(worker) as ssh:
@@ -2184,7 +1428,7 @@ class SliceManager:
                     
                     if stdout.strip():
                         vm['qemu_pid'] = int(stdout.strip())
-                        Logger.success(f"VM {vm['id']} iniciada con PID {vm['qemu_pid']}")
+                        Logger.success(f"VM ID-{vm['id']} iniciada con PID {vm['qemu_pid']}")
                     else:
                         raise Exception(
                             f"No se pudo obtener PID de QEMU para VM {vm['id']}"
@@ -2249,6 +1493,65 @@ class SliceManager:
             Logger.section(f"DETENIENDO SLICE {slice_id}")
             Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
+            # Limpieza en el HeadNode
+
+            #Configuración DHCP y de RED:
+            network_config = request_data['network_config']
+            svlan = network_config['svlan_id']
+            network = network_config['network']
+            gateway_if = network_config['gateway_interface']
+
+            # Matar dnsmasq
+            cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
+            try:
+                pid = subprocess.check_output(cmd, shell=True).decode().strip()
+                if pid:
+                    Logger.info(f"Matando proceso dnsmasq (PID: {pid})")
+                    os.system(f"sudo kill -9 {pid}")
+            except subprocess.CalledProcessError:
+                Logger.debug("No se encontró proceso dnsmasq activo")
+
+            # 1. Eliminar interfaces del bridge OVS
+            Logger.info("Eliminando interfaces del bridge OVS...")
+            ovs_cleanup_commands = [
+                f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}"
+            ]
+            for cmd in ovs_cleanup_commands:
+                os.system(cmd)
+
+            # 2. Eliminar interfaces del host
+            Logger.info("Eliminando interfaces del host...")
+            host_cleanup_commands = [
+                f"sudo ip link del {gateway_if} 2>/dev/null || true"
+            ]
+            for cmd in host_cleanup_commands:
+                os.system(cmd)
+
+            # 3. Eliminar interfaces dentro del namespace
+            Logger.info("Eliminando interfaces del namespace...")
+            ns_cleanup_commands = [
+                f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link del veth-int.{svlan} 2>/dev/null || true"
+            ]
+            for cmd in ns_cleanup_commands:
+                os.system(cmd)
+
+            # 4. Limpiar reglas de iptables y forwarding
+            Logger.info("Limpiando reglas de red...")
+            cleanup_commands = [
+                f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                "sudo sysctl -w net.ipv4.ip_forward=1"
+            ]
+            for cmd in cleanup_commands:
+                os.system(cmd)
+
+            # 5. Limpiar configuración DHCP
+            Logger.info("Limpiando configuración DHCP...")
+            dhcp_config = os.path.join(DATA_DIR['dhcp']['config'], f'dnsmasq.{svlan}.conf')
+            if os.path.exists(dhcp_config):
+                os.remove(dhcp_config)
+
             # Agrupar VMs por worker
             vms_by_worker = {}
             for vm in request_data['vms']:
@@ -2284,7 +1587,7 @@ class SliceManager:
                         # 1. Detener VMs
                         for vm in vms:
                             try:
-                                Logger.info(f"Deteniendo VM {vm['id']}")
+                                Logger.info(f"Deteniendo VM ID-{vm['id']}")
                                 
                                 # Verificar si proceso existe
                                 stdout, _ = ssh.execute(
@@ -2309,28 +1612,29 @@ class SliceManager:
                                         f"pgrep -f 'guest=VM{vm['id']}-S{slice_id}'"
                                     )
                                     if stdout.strip():
-                                        Logger.warning(f"VM {vm['id']} sigue corriendo, usando kill -9")
+                                        Logger.warning(f"VM ID-{vm['id']} sigue corriendo, usando kill -9")
                                         ssh.execute(f"sudo kill -9 {qemu_pid}")
                                         time.sleep(1)
                                     else:
-                                        Logger.success(f"VM {vm['id']} detenida exitosamente")
+                                        Logger.success(f"VM ID-{vm['id']} detenida exitosamente")
                                 else:
-                                    Logger.debug(f"VM {vm['id']} ya no está corriendo")
+                                    Logger.debug(f"VM ID-{vm['id']} ya no está corriendo")
 
                             except Exception as e:
                                 if "No such process" not in str(e) and "status=1" not in str(e):
                                     raise
-                                Logger.debug(f"VM {vm['id']} ya no está corriendo")
+                                Logger.debug(f"VM ID-{vm['id']} ya no está corriendo")
 
                         # 2. Limpiar recursos
                         cleanup_commands = [
                             f"sudo ovs-vsctl --if-exists del-port br-int p-br-s{slice_id}",
                             f"sudo ovs-vsctl --if-exists del-port br-s{slice_id} p-s{slice_id}-int",
                             f"sudo ovs-vsctl --if-exists del-br br-s{slice_id}",
+                            f"sudo rm -f /home/ubuntu/SliceManager/images/vm-*-slice-{slice_id}*.qcow2",
                             f"sudo ip link show | grep 'tap.*-S{slice_id}' | cut -d':' -f2 | xargs -I{{}} sudo ip link del {{}} 2>/dev/null || true",
-                            f"sudo rm -f /home/ubuntu/SliceManager/images/vm-*-slice-{slice_id}*.qcow2"
+                            f"sudo ovs-vsctl list-ports br-int | grep 'tapx' | xargs -I{{}} sudo ovs-vsctl del-port br-int {{}} && sudo ip link show | grep 'tapx' | cut -d':' -f2 | xargs -I{{}} sudo ip link del {{}} 2>/dev/null || true"
                         ]
-
+                    
                         Logger.info(f"Ejecutando limpieza en {worker_name}")
                         try:
                             ssh.execute(" && ".join(cleanup_commands))
@@ -2401,7 +1705,7 @@ class SliceManager:
             Logger.debug(f"Worker IDs solicitados: {worker_ids}")
             
             vnc_response = requests.post(
-                'http://localhost:5001/get-available-vnc-displays',
+                'http://127.0.0.1:5001/get-available-vnc-displays',
                 json={'worker_ids': worker_ids}
             )
 
@@ -2418,11 +1722,11 @@ class SliceManager:
             for worker_id in set(str(vm['physical_server']['id']) for vm in request_data['vms']):
                 display_assignments[worker_id] = {}
                 worker_displays = available_displays[worker_id]
-                Logger.debug(f"Worker {worker_id} tiene {len(worker_displays)} displays disponibles: {worker_displays}")
+                Logger.debug(f"Worker ID-{worker_id} tiene {len(worker_displays)} displays disponibles: {worker_displays}")
                 
                 # Obtener VMs para este worker
                 worker_vms = [vm for vm in request_data['vms'] if str(vm['physical_server']['id']) == worker_id]
-                Logger.debug(f"Worker {worker_id} tiene {len(worker_vms)} VMs para reiniciar")
+                Logger.debug(f"Worker ID-{worker_id} tiene {len(worker_vms)} VMs para reiniciar")
                 
                 if len(worker_vms) > len(worker_displays):
                     raise Exception(f"No hay suficientes displays para worker {worker_id}. " 
@@ -2432,7 +1736,7 @@ class SliceManager:
                 for idx, vm in enumerate(worker_vms):
                     display = worker_displays[idx]
                     display_assignments[worker_id][vm['id']] = display
-                    Logger.debug(f"Pre-asignando display {display} a VM {vm['id']} en worker {worker_id}")
+                    Logger.debug(f"Pre-asignando display {display} a VM ID-{vm['id']} en Worker ID-{worker_id}")
                 
                 # Guardar información en vms_by_worker
                 vms_by_worker[worker_id] = {
@@ -2448,7 +1752,7 @@ class SliceManager:
 
                     # Pausar VMs
                     for vm in worker_data['vms']:
-                        Logger.info(f"Pausando VM {vm['id']}")
+                        Logger.info(f"Pausando VM ID-{vm['id']}")
                         self.pause_vm({
                             "vm_info": {
                                 "id": vm['id'],
@@ -2464,7 +1768,7 @@ class SliceManager:
                     for vm in worker_data['vms']:
                         # Usar el display pre-asignado para esta VM
                         assigned_display = display_assignments[worker_id][vm['id']]
-                        Logger.info(f"Reanudando VM {vm['id']} con display {assigned_display} en Worker {worker_id}")
+                        Logger.info(f"Reanudando VM ID-{vm['id']} con display {assigned_display} en Worker ID-{worker_id}")
                         
                         # Verificar si el display ya está en uso
                         Logger.debug(f"Verificando si display {assigned_display} está en uso...")
@@ -2490,7 +1794,7 @@ class SliceManager:
                                 "vnc_port": 5900 + assigned_display,
                                 "status": "running"
                             })
-                            Logger.debug(f"VM {vm['id']} reiniciada exitosamente con display {assigned_display}")
+                            Logger.debug(f"VM ID-{vm['id']} reiniciada exitosamente con display {assigned_display}")
 
                     results[worker_id] = {
                         "success": True,
@@ -2550,7 +1854,7 @@ class SliceManager:
                 Logger.info(f"Worker {worker_id}:")
                 Logger.info(f"  Displays usados: {summary['displays']}")
                 for vm_id, display in summary['vm_assignments'].items():
-                    Logger.info(f"  VM {vm_id} → Display {display}")
+                    Logger.info(f"  VM ID-{vm_id} → Display N°{display}")
 
             if errors:
                 raise Exception("\n".join(errors))
@@ -2685,7 +1989,7 @@ class SliceManager:
             # Obtener display VNC
             Logger.info("Obteniendo display VNC...")
             vnc_response = requests.post(
-                'http://localhost:5001/get-available-vnc-displays',
+                'http://127.0.0.1:5001/get-available-vnc-displays',
                 json={'worker_ids': [worker_info['id']]}
             )
 
@@ -2799,64 +2103,13 @@ class SliceManager:
                 if not stdout.strip() or stdout.strip() not in ['R', 'S']:
                     raise Exception(f"Proceso QEMU {qemu_pid} no está corriendo correctamente")
 
-                Logger.success(f"VM {vm_info['name']} iniciada con PID {qemu_pid}")
+                Logger.success(f"VM ID-{vm_info['id']} iniciada con PID {qemu_pid}")
                 return True, qemu_pid, vnc_display
 
         except Exception as e:
             Logger.error(f"Error reanudando VM: {str(e)}")
             Logger.debug(f"Traceback: {traceback.format_exc()}")
             return False, 0, 0
-
-    def _build_qemu_command(self, vm_name: str, flavor: dict, image_path: str, vnc_display: int, extra_args: list = None) -> str:
-        """
-        Construye el comando QEMU con los argumentos necesarios.
-
-        Genera el comando completo para iniciar una VM con QEMU/KVM incluyendo:
-        - Configuración básica (KVM, nombre)
-        - Recursos asignados (RAM, vCPUs)
-        - Imagen y formato
-        - Display VNC
-        - Argumentos adicionales opcionales
-
-        Args:
-            vm_name (str): Nombre para la VM en QEMU
-            flavor (dict): Configuración de recursos con:
-                - ram: RAM en MB
-                - vcpus: Número de vCPUs
-            image_path (str): Ruta a la imagen de disco
-            vnc_display (int): Número de display VNC
-            extra_args (list, optional): Argumentos QEMU adicionales
-
-        Returns:
-            str: Comando QEMU completo listo para ejecutar
-        """
-        Logger.debug(f"Construyendo comando QEMU para VM {vm_name}")
-        Logger.debug(f"Flavor: {json.dumps(flavor, indent=2)}")
-        Logger.debug(f"Imagen: {image_path}")
-        Logger.debug(f"Display VNC: {vnc_display}")
-
-        # Comandos base
-        cmd = [
-            "sudo qemu-system-x86_64",
-            "-enable-kvm",
-            f"-name guest={vm_name}",
-            f"-m {flavor['ram']}",
-            f"-smp {flavor['vcpus']}",
-            f"-drive file={image_path},format=qcow2",
-            f"-vnc 0.0.0.0:{vnc_display}",
-            "-daemonize",
-            "-D /tmp/qemu.log",  # Agregado para logging
-            "-d guest_errors"    # Agregado para debugging
-        ]
-
-        # Agregar argumentos extra si existen
-        if extra_args:
-            Logger.debug(f"Agregando argumentos extra: {extra_args}")
-            cmd.extend(extra_args)
-
-        command = " ".join(cmd)
-        Logger.debug(f"Comando QEMU generado: {command}")
-        return command
 
     def restart_vm(self, request_data: dict) -> Tuple[bool, int, int]:
         """
@@ -2884,7 +2137,7 @@ class SliceManager:
             Exception: Si hay errores en la pausa o reanudación
         """
         try:
-            Logger.section(f"REINICIANDO VM {request_data['vm_info']['id']}")
+            Logger.section(f"REINICIANDO VM ID-{request_data['vm_info']['id']}")
             Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
             # 1. Pausar la VM
@@ -2903,92 +2156,13 @@ class SliceManager:
             if not success:
                 raise Exception("Error durante la reanudación de la VM")
 
-            Logger.success(f"VM reiniciada exitosamente (PID: {qemu_pid}, Display: {vnc_display})")
+            Logger.success(f"VM ID-{request_data['vm_info']['id']} reiniciada exitosamente (PID: {qemu_pid}, Display: {vnc_display})")
             return True, qemu_pid, vnc_display
 
         except Exception as e:
-            Logger.error(f"Error reiniciando VM {request_data['vm_info']['id']}: {str(e)}")
+            Logger.error(f"Error reiniciando VM ID-{request_data['vm_info']['id']}: {str(e)}")
             Logger.debug(f"Traceback: {traceback.format_exc()}")
             return False, 0, 0
-
-    def _cleanup_interfaces_and_bridges(self, worker: str, slice_id: int, svlan: int, interfaces: list):
-        """
-        Limpia interfaces de red y bridges OVS de un worker en orden correcto.
-
-        Realiza la limpieza en el siguiente orden:
-        1. Interfaces TAP (eliminación del switch y del sistema)
-        2. Patch ports entre bridges
-        3. Bridge del slice
-        
-        Args:
-            worker (str): Nombre del worker a limpiar
-            slice_id (int): ID del slice
-            svlan (int): ID del SVLAN del slice
-            interfaces (list): Lista de interfaces a limpiar
-            
-        Raises:
-            Exception: Si hay errores durante la limpieza
-        """
-        try:
-            Logger.subsection(f"LIMPIANDO INTERFACES EN {worker}")
-            
-            with SSHManager(worker) as ssh:
-                slice_bridge = f"br-s{slice_id}"
-                patch_slice = f"p-s{svlan}-int"
-                patch_int = f"p-br-s{svlan}"
-                
-                Logger.debug(f"Bridge: {slice_bridge}")
-                Logger.debug(f"Patch ports: {patch_slice} <-> {patch_int}")
-
-                # 1. Limpiar interfaces TAP
-                Logger.info("Limpiando interfaces TAP...")
-                for interface in interfaces:
-                    tap_name = interface.get('tap_name') or (
-                        f"tapx-VM{interface['vm_id']}-S{slice_id}" 
-                        if interface['external_access'] 
-                        else f"tap-VM{interface['vm_id']}-S{slice_id}"
-                    )
-                    
-                    try:
-                        # Remover del switch correspondiente
-                        if interface['external_access']:
-                            ssh.execute(f"sudo ovs-vsctl --if-exists del-port br-int {tap_name}")
-                        else:
-                            ssh.execute(f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {tap_name}")
-                        Logger.debug(f"Interface {tap_name} removida del switch")
-                    except Exception as e:
-                        Logger.warning(f"Error removiendo {tap_name} del switch: {str(e)}")
-
-                # 2. Remover patch ports
-                Logger.info("Limpiando patch ports...")
-                ssh.execute(f"sudo ovs-vsctl --if-exists del-port br-int {patch_int}")
-                ssh.execute(f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {patch_slice}")
-                
-                # 3. Eliminar bridge
-                Logger.info("Eliminando bridge del slice...")
-                ssh.execute(f"sudo ovs-vsctl --if-exists del-br {slice_bridge}")
-                
-                # 4. Eliminar interfaces TAP del sistema
-                Logger.info("Eliminando interfaces TAP del sistema...")
-                for interface in interfaces:
-                    tap_name = interface.get('tap_name') or (
-                        f"tapx-VM{interface['vm_id']}-S{slice_id}" 
-                        if interface['external_access'] 
-                        else f"tap-VM{interface['vm_id']}-S{slice_id}"
-                    )
-                    try:
-                        ssh.execute(f"sudo ip link set {tap_name} down 2>/dev/null || true")
-                        ssh.execute(f"sudo ip tuntap del {tap_name} mode tap 2>/dev/null || true")
-                        Logger.debug(f"Interface {tap_name} eliminada del sistema")
-                    except Exception as e:
-                        Logger.warning(f"Error eliminando {tap_name} del sistema: {str(e)}")
-
-            Logger.success(f"Limpieza de interfaces en {worker} completada")
-
-        except Exception as e:
-            Logger.error(f"Error limpiando interfaces en {worker}: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            raise
 
     def _cleanup_deployment_state(self, slice_config: dict, current_stage: str = None):
         """
@@ -3007,19 +2181,20 @@ class SliceManager:
             dhcp_if = network_config['dhcp_interface']
             gateway_if = network_config['gateway_interface']
 
-            # Orden de limpieza
+            # Orden de limpieza (de más crítico a menos crítico)
             deployment_order = [
-                'init',          # VNC ports
-                'network',       # Red y DHCP 
-                'images',        # Imágenes base
-                'worker_setup'   # Configuración completa
+                'worker_setup',   # Configuración completa
+                'images',         # Imágenes base
+                'network',        # Red y DHCP 
+                'init'           # VNC ports
             ]
 
             # Determinar etapas a limpiar
             if current_stage:
                 try:
                     start_index = deployment_order.index(current_stage)
-                    stages_to_clean = deployment_order[start_index:]
+                    stages_to_clean = deployment_order[start_index:]  # Desde la etapa actual hasta el final
+                    Logger.info(f"Limpiando desde {current_stage} hasta init")
                 except ValueError:
                     Logger.warning(f"Etapa '{current_stage}' no reconocida, limpiando todo")
                     stages_to_clean = deployment_order
@@ -3052,10 +2227,10 @@ class SliceManager:
                         # 1. Matar procesos QEMU
                         for vm in vms:
                             try:
-                                Logger.info(f"Matando proceso QEMU de VM {vm['id']}...")
+                                Logger.info(f"Matando proceso QEMU de VM ID-{vm['id']}...")
                                 ssh.execute(f"sudo pkill -9 -f 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}' 2>/dev/null || true")
                             except Exception as e:
-                                Logger.warning(f"Error matando proceso de VM {vm['id']}: {str(e)}")
+                                Logger.warning(f"Error matando proceso de VM ID-{vm['id']}: {str(e)}")
 
                         time.sleep(2)
 
@@ -3108,16 +2283,11 @@ class SliceManager:
             for stage in stages_to_clean:
                 Logger.subsection(f"LIMPIANDO ETAPA: {stage}")
 
-                if stage == 'init':
-                    Logger.info("Limpiando recursos básicos...")
-                    for vm in slice_config['topology_info']['vms']:
-                        self.vnc_manager.deallocate_port(str(vm['id']))
-
-                elif stage == 'network':
-                    Logger.info("Limpiando configuración de red y DHCP...")
+                if stage == 'network' or stage == 'init':
+                    Logger.info("Limpiando configuración inicial de red y DHCP...")
                     try:
                         # Matar dnsmasq
-                        cmd = f"pgrep -f 'dnsmasq.*{svlan}.conf'"
+                        cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
                         try:
                             pid = subprocess.check_output(cmd, shell=True).decode().strip()
                             if pid:
@@ -3126,20 +2296,43 @@ class SliceManager:
                         except subprocess.CalledProcessError:
                             Logger.debug("No se encontró proceso dnsmasq activo")
 
-                        # Limpiar red
-                        cleanup_commands = [
-                            f"sudo pkill -9 -f 'dnsmasq.*{svlan}.conf'",
-                            f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link del {dhcp_if} 2>/dev/null || true",
-                            f"ip link del {gateway_if} 2>/dev/null || true", 
-                            f"sudo iptables -D FORWARD -s {network} -j ACCEPT 2>/dev/null || true",
-                            f"sudo iptables -D FORWARD -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true",
-                            f"sudo iptables -t nat -D POSTROUTING -s {network} -o ens3 -j MASQUERADE 2>/dev/null || true"
+                        # 1. Eliminar interfaces del bridge OVS
+                        Logger.info("Eliminando interfaces del bridge OVS...")
+                        ovs_cleanup_commands = [
+                            f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}"
                         ]
+                        for cmd in ovs_cleanup_commands:
+                            os.system(cmd)
 
+                        # 2. Eliminar interfaces del host
+                        Logger.info("Eliminando interfaces del host...")
+                        host_cleanup_commands = [
+                            f"sudo ip link del {gateway_if} 2>/dev/null || true"
+                        ]
+                        for cmd in host_cleanup_commands:
+                            os.system(cmd)
+
+                        # 3. Eliminar interfaces dentro del namespace
+                        Logger.info("Eliminando interfaces del namespace...")
+                        ns_cleanup_commands = [
+                            f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link del veth-int.{svlan} 2>/dev/null || true"
+                        ]
+                        for cmd in ns_cleanup_commands:
+                            os.system(cmd)
+
+                        # 4. Limpiar reglas de iptables y forwarding
+                        Logger.info("Limpiando reglas de red...")
+                        cleanup_commands = [
+                            f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                            f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+                            f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                            "sudo sysctl -w net.ipv4.ip_forward=1"
+                        ]
                         for cmd in cleanup_commands:
                             os.system(cmd)
 
-                        # Limpiar DHCP
+                        # 5. Limpiar configuración DHCP
+                        Logger.info("Limpiando configuración DHCP...")
                         dhcp_config = os.path.join(DATA_DIR['dhcp']['config'], f'dnsmasq.{svlan}.conf')
                         if os.path.exists(dhcp_config):
                             os.remove(dhcp_config)
@@ -3579,70 +2772,6 @@ def deploy_slice_endpoint():
             "details": str(e)
         }), 500
 
-@app.route('/slice/<slice_id>', methods=['GET'])
-def get_slice(slice_id):
-    """
-    Obtiene información detallada de un slice específico.
-
-    Args:
-        slice_id: ID del slice a consultar
-        
-    Returns:
-        200: Información del slice
-        400: ID inválido
-        404: Slice no encontrado
-        500: Error interno
-    """
-    try:
-        Logger.major_section(f"API: GET SLICE ID-{slice_id}")
-        
-        # Validar ID
-        try:
-            slice_id = int(slice_id)
-        except ValueError:
-            Logger.error(f"ID inválido: {slice_id}")
-            return jsonify({
-                "status": "error",
-                "message": "ID de slice inválido",
-                "details": "El ID debe ser un número entero"
-            }), 400
-
-        # Buscar slice
-        Logger.info(f"Buscando slice {slice_id}")
-        slices_data = load_json_file(DATA_FILES['slices'])
-        slice_data = next(
-            (s for s in slices_data['slices'] 
-             if s['slice_info']['id'] == slice_id),
-            None
-        )
-        
-        if not slice_data:
-            Logger.error(f"Slice {slice_id} no encontrado")
-            return jsonify({
-                "status": "error",
-                "message": f"No se encontró el slice {slice_id}",
-                "details": "El slice solicitado no existe"
-            }), 404
-            
-        # Log y retornar resultado
-        Logger.success(f"Slice {slice_id} encontrado")
-        Logger.debug(f"Datos: {json.dumps(slice_data, indent=2)}")
-            
-        return jsonify({
-            "status": "success",
-            "message": "Información de slice obtenida exitosamente",
-            "content": slice_data
-        }), 200
-        
-    except Exception as e:
-        Logger.error(f"Error obteniendo slice: {str(e)}")
-        Logger.debug(f"Traceback: {traceback.format_exc()}")
-        return jsonify({
-            "status": "error",
-            "message": "Error obteniendo información del slice",
-            "details": str(e)
-        }), 500
-
 @app.route('/stop-slice/<slice_id>', methods=['POST'])
 def stop_slice_endpoint(slice_id: str):
     """
@@ -3742,39 +2871,6 @@ def stop_slice_endpoint(slice_id: str):
         return jsonify({
             "status": "error",
             "message": "Error deteniendo slice",
-            "details": str(e)
-        }), 500
-
-@app.route('/slices', methods=['GET'])
-def list_slices():
-    """
-    Lista todos los slices activos en el sistema.
-    
-    Returns:
-        200: Lista de slices obtenida exitosamente
-        500: Error interno obteniendo los datos
-    """
-    try:
-        Logger.major_section("API: LIST SLICES")
-        
-        Logger.info("Cargando datos de slices...")
-        slices_data = load_json_file(DATA_FILES['slices'])
-        
-        Logger.debug(f"Slices encontrados: {len(slices_data['slices'])}")
-        Logger.debug(f"Datos: {json.dumps(slices_data['slices'], indent=2)}")
-        
-        return jsonify({
-            "status": "success",
-            "message": "Slices obtenidos exitosamente",
-            "content": slices_data['slices']
-        }), 200
-
-    except Exception as e:
-        Logger.error(f"Error obteniendo slices: {str(e)}")
-        Logger.debug(f"Traceback: {traceback.format_exc()}")
-        return jsonify({
-            "status": "error",
-            "message": "Error obteniendo slices",
             "details": str(e)
         }), 500
 
@@ -3929,16 +3025,16 @@ def pause_vm_endpoint(vm_id):
             }), 400
 
         # Pausar VM
-        Logger.info(f"Pausando VM {vm_id}...")
+        Logger.info(f"Pausando VM ID-{vm_id}...")
         slice_manager = SliceManager()
         
         if slice_manager.pause_vm(request_data):
             vm_info = request_data['vm_info']
-            Logger.success(f"VM {vm_info['name']} pausada exitosamente")
+            Logger.success(f"VM ID-{vm_id} pausada exitosamente")
             
             return jsonify({
                 "status": "success",
-                "message": f"VM {vm_info['name']} pausada exitosamente",
+                "message": f"VM ID-{vm_id} pausada exitosamente",
                 "content": {
                     "vm_id": vm_info['id'],
                     "status": "paused"
@@ -4015,15 +3111,15 @@ def resume_vm_endpoint(vm_id):
             }), 400
 
         # Reanudar VM 
-        Logger.info(f"Reanudando VM {vm_id}...")
+        Logger.info(f"Reanudando VM ID-{vm_id}...")
         slice_manager = SliceManager()
         success, qemu_pid, vnc_display = slice_manager.resume_vm(request_data)
 
         if success:
-            Logger.success(f"VM {request_data['vm_info']['name']} reanudada exitosamente")
+            Logger.success(f"VM ID-{vm_id} reanudada exitosamente")
             return jsonify({
                 "status": "success",
-                "message": f"VM {request_data['vm_info']['name']} reanudada exitosamente",
+                "message": f"VM ID-{vm_id} reanudada exitosamente",
                 "content": {
                     "vm_id": request_data['vm_info']['id'],
                     "qemu_pid": qemu_pid,
@@ -4103,13 +3199,13 @@ def restart_vm_endpoint(vm_id: str):
             }), 400
 
         # Reiniciar VM
-        Logger.info(f"Reiniciando VM {vm_id}...")
+        Logger.info(f"Reiniciando VM ID-{vm_id}...")
         slice_manager = SliceManager()
         success, qemu_pid, vnc_display = slice_manager.restart_vm(request_data)
         
         if success:
             vm_info = request_data['vm_info']
-            Logger.success(f"VM {vm_info['name']} reiniciada exitosamente")
+            Logger.success(f"VM ID-{vm_id} reiniciada exitosamente")
             return jsonify({
                 "status": "success",
                 "message": f"VM {vm_info['name']} reiniciada exitosamente",
@@ -4138,65 +3234,6 @@ def restart_vm_endpoint(vm_id: str):
             "details": str(e)
         }), 500
     
-@app.route('/vm/<vm_id>', methods=['GET'])
-def get_vm_endpoint(vm_id: str):
-    """
-    Obtiene información detallada de una VM específica.
-
-    Args:
-        vm_id: ID de la VM a consultar
-
-    Returns:
-        200: Información de la VM
-        400: ID inválido
-        404: VM no encontrada
-        500: Error interno
-    """
-    try:
-        Logger.major_section(f"API: GET VM ID-{vm_id}")
-        
-        # Validar ID
-        try:
-            vm_id = int(vm_id)
-        except ValueError:
-            Logger.error(f"ID inválido: {vm_id}")
-            return jsonify({
-                "status": "error",
-                "message": "ID de VM inválido",
-                "details": "El ID debe ser un número entero"
-            }), 400
-
-        # Obtener información
-        Logger.info(f"Buscando VM {vm_id}...")
-        slice_manager = SliceManager()
-        vm_info = slice_manager.get_vm_info(vm_id)
-        
-        if not vm_info:
-            Logger.error(f"VM {vm_id} no encontrada")
-            return jsonify({
-                "status": "error",
-                "message": f"No se encontró la VM {vm_id}",
-                "details": "La VM solicitada no existe"
-            }), 404
-
-        Logger.success(f"VM {vm_id} encontrada")
-        Logger.debug(f"Información: {json.dumps(vm_info, indent=2)}")
-        
-        return jsonify({
-            "status": "success",
-            "message": "Información de VM obtenida exitosamente",
-            "content": vm_info
-        }), 200
-        
-    except Exception as e:
-        Logger.error(f"Error obteniendo VM: {str(e)}")
-        Logger.debug(f"Traceback: {traceback.format_exc()}")
-        return jsonify({
-            "status": "error",
-            "message": "Error obteniendo información de la VM",
-            "details": str(e)
-        }), 500
-
 @app.route('/sync-images', methods=['POST'])
 def sync_images_endpoint():
     """
@@ -4337,22 +3374,17 @@ if __name__ == '__main__':
             raise Exception("No se pudo crear la estructura de directorios necesaria")
         Logger.success("Estructura de directorios verificada")
         
-        # 2. Inicializar archivos de datos
-        Logger.info("Inicializando archivos de datos...")
-        init_data_files()
-        Logger.success("Archivos de datos inicializados")
-
-        # 3. Inicializar servicios
+        # 2. Inicializar servicios
         Logger.section("INICIANDO SERVICIOS")
         
-        # 4. Iniciar servidor Flask
+        # 3. Iniciar servidor Flask
         Logger.section("INICIANDO SERVIDOR WEB")
         Logger.info("Configuración del servidor:")
         Logger.info("- Host: 0.0.0.0")
         Logger.info("- Puerto: 5000")
         Logger.info("- Debug: Activado")
         
-        Logger.success("Slice Manager listo para recibir conexiones")
+        Logger.success("Slice Controller listo para recibir conexiones")
         Logger.debug("Iniciando servidor Flask...")
         
         app.run(
