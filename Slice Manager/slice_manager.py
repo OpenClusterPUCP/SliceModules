@@ -68,11 +68,15 @@ import time
 # Utilidades:
 import json
 import jwt
+import base64
 import mysql.connector
 from mysql.connector import pooling
 from datetime import timedelta
 from decimal import Decimal
-from typing import Dict, List, Union, Tuple
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
+from typing import Dict, List, Union, Tuple, Optional 
 
 
 # ===================== CONFIGURACIÓN DE FLASK =====================
@@ -331,6 +335,163 @@ class VNCTokenManager:
         except Exception as e:
             Logger.error(f"Error validando token VNC: {str(e)}")
             return False
+
+class JWTManager:
+    """
+    Manejador de tokens JWT usando llave pública RSA.
+    """
+    
+    PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy3uQ4UZwnOu7C/Xyp5YA
+7j4wtSrf78XHI8z8pKmaa6t7hB/Mj/+p1eVvzbWMWBnAhybg2llTyMp73B2lbduG
+EFj5fkYopdVgeBfPiRgePHvrYAou1/lkxZZmApbREnqLWKrreITI2xYVnqzHVr2A
+tpiKnDihj0LdggkMoyWz/+P81v6YdHk+sEeWKFXfRrOLgSs6UT158SQY1ES7VfPa
+L4oYXt0W5kaMyfpA5+7yyScDUZefU1lfXR9erNTYPNQpytryeSt67cdxuum8Mask
+6CqawwYHHqBIlk4weZ19wjwCh/RbXaKo+qIPA9eWupsLeWiw+ysfrnXCArRsff2l
+lQIDAQAB
+-----END PUBLIC KEY-----"""
+
+    def __init__(self):
+        """Inicializa el gestor de JWT"""
+        try:
+            # Procesar PEM a objeto de clave pública
+            self.public_key = serialization.load_pem_public_key(
+                self.PUBLIC_KEY_PEM.encode(),
+                backend=default_backend()
+            )
+            Logger.success("Clave pública RSA cargada exitosamente")
+        except Exception as e:
+            Logger.error(f"Error cargando clave pública: {str(e)}")
+            raise
+
+    def get_username_from_token(self, token: str) -> Optional[str]:
+        """
+        Obtiene el username del token JWT.
+        
+        Args:
+            token (str): Token JWT completo (incluyendo 'Bearer ')
+            
+        Returns:
+            Optional[str]: Username extraído o None si hay error
+        """
+        try:
+            # Remover 'Bearer ' si está presente
+            if token.startswith('Bearer '):
+                token = token[7:]
+
+            # Decodificar token usando PyJWT
+            decoded = jwt.decode(
+                token,
+                self.PUBLIC_KEY_PEM,  # Usar PEM completo
+                algorithms=['RS256'],
+                options={"verify_signature": True}
+            )
+            
+            # El username está en el claim 'sub'
+            username = decoded.get('sub')
+            Logger.debug(f"Username extraído del token: {username}")
+            return username
+            
+        except jwt.ExpiredSignatureError:
+            Logger.warning("Token expirado")
+            return None
+        except jwt.InvalidTokenError as e:
+            Logger.error(f"Token inválido: {str(e)}")
+            return None
+        except Exception as e:
+            Logger.error(f"Error procesando token: {str(e)}")
+            return None
+    
+    def validate_token(self, token: str) -> bool:
+        """
+        Valida un token JWT.
+        
+        Args:
+            token (str): Token JWT a validar
+            
+        Returns:
+            bool: True si el token es válido
+        """
+        try:
+            if token.startswith('Bearer '):
+                token = token[7:]
+                
+            decoded = jwt.decode(
+                token,
+                self.public_key,
+                algorithms=['RS256']
+            )
+            
+            # Verificar expiración
+            exp = decoded.get('exp')
+            if exp and datetime.fromtimestamp(exp) < datetime.utcnow():
+                return False
+                
+            return True
+            
+        except:
+            return False
+
+    def get_user_id_from_username(self, username: str, db) -> Optional[int]:
+        """
+        Obtiene el ID del usuario desde la base de datos.
+        
+        Args:
+            username (str): Username a buscar
+            db: Instancia de DatabaseManager
+            
+        Returns:
+            Optional[int]: ID del usuario o None si no se encuentra
+        """
+        try:
+            result = db.execute_query(
+                "SELECT id FROM user WHERE username = %s",
+                (username,)
+            )
+            if result:
+                return result[0]['id']
+            return None
+        except Exception as e:
+            Logger.error(f"Error obteniendo user_id: {str(e)}")
+            return None
+
+    def get_role_from_token(self, token: str) -> Optional[str]:
+        """
+        Obtiene el rol del usuario desde el token JWT.
+        
+        Args:
+            token (str): Token JWT completo (incluyendo 'Bearer ')
+            
+        Returns:
+            Optional[str]: Rol del usuario o None si hay error
+        """
+        try:
+            # Remover 'Bearer ' si está presente
+            if token.startswith('Bearer '):
+                token = token[7:]
+
+            # Decodificar token usando PyJWT
+            decoded = jwt.decode(
+                token,
+                self.PUBLIC_KEY_PEM,  # Usar PEM completo
+                algorithms=['RS256'],
+                options={"verify_signature": True}
+            )
+            
+            # El rol está en el claim 'roles'
+            roles = decoded.get('roles')
+            Logger.debug(f"Roles extraídos del token: {roles}")
+            return roles
+            
+        except jwt.ExpiredSignatureError:
+            Logger.warning("Token expirado")
+            return None
+        except jwt.InvalidTokenError as e:
+            Logger.error(f"Token inválido: {str(e)}")
+            return None
+        except Exception as e:
+            Logger.error(f"Error procesando token: {str(e)}")
+            return None
 
 class DatabaseManager:
     """
@@ -1890,15 +2051,60 @@ def pause_vm_endpoint(vm_id: str):
         Logger.major_section(f"API: PAUSE VM ID-{vm_id}")
         vm_id = int(vm_id)
 
-        # 0. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 0. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 1. Verificar existencia de VM y acceso del usuario
         Logger.debug(f"Verificando acceso del usuario {user_id} a VM {vm_id}")
@@ -2054,15 +2260,60 @@ def resume_vm_endpoint(vm_id: str):
         Logger.major_section(f"API: RESUME VM ID-{vm_id}")
         vm_id = int(vm_id)
 
-        # 0. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 0. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 1. Verificar existencia de VM y acceso del usuario
         Logger.debug(f"Verificando acceso del usuario {user_id} a VM {vm_id}")
@@ -2272,15 +2523,60 @@ def restart_vm_endpoint(vm_id: str):
         Logger.major_section(f"API: RESTART VM ID-{vm_id}")
         vm_id = int(vm_id)
 
-        # 1. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 1. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 2. Verificar existencia de VM y acceso del usuario
         Logger.debug(f"Verificando acceso del usuario {user_id} a VM {vm_id}")
@@ -2469,15 +2765,60 @@ def restart_slice_endpoint(slice_id: str):
         Logger.major_section(f"API: RESTART SLICE ID-{slice_id}")
         slice_id = int(slice_id)
 
-        # 0. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 0. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 0.1 Verificar acceso del usuario a través de property
         Logger.debug(f"Verificando acceso del usuario {user_id} al slice {slice_id}")
@@ -2736,15 +3077,60 @@ def stop_slice_endpoint(slice_id: str):
         Logger.major_section(f"API: STOP SLICE ID-{slice_id}")
         slice_id = int(slice_id)
 
-        # 0. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 0. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 0.1 Verificar acceso del usuario a través de property
         Logger.debug(f"Verificando acceso del usuario {user_id} al slice {slice_id}")
@@ -2971,14 +3357,59 @@ def get_slice(slice_id):
         slice_id = int(slice_id)
         
         # 0. Validar al usuario y su relación con la slice
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # Verificar acceso del usuario a través de la tabla property
         Logger.debug(f"Verificando acceso del usuario {user_id} al slice {slice_id}")
@@ -3073,11 +3504,13 @@ def get_slice(slice_id):
 
         # 4. Obtener interfaces de red
         Logger.debug("Consultando interfaces de red")
+        Logger.debug("Consultando interfaces de red")
         interfaces = db.execute_query(
             """SELECT i.* 
-               FROM interface i
-               JOIN virtual_machine vm ON i.vm = vm.id
-               WHERE vm.slice = %s""",
+            FROM interface i
+            JOIN virtual_machine vm ON i.vm = vm.id
+            WHERE vm.slice = %s
+            ORDER BY i.external_access DESC""",  # Ordenar por external_access descendente (1 antes que 0)
             (slice_id,)
         )
         Logger.debug(f"Interfaces encontradas: {len(interfaces)}")
@@ -3170,13 +3603,227 @@ def get_slice(slice_id):
             "details": str(e)
         }), 500
 
+@app.route('/vm/<vm_id>', methods=['GET'])
+def get_vm(vm_id):
+    """
+    Obtiene información detallada de una máquina virtual específica.
+    
+    Args:
+        vm_id (str): ID de la VM a consultar
+        
+
+    Returns:
+        Response: Información completa de la VM incluyendo:
+            - Información básica de la VM
+            - Recursos asignados (flavor)
+            - Imagen base
+            - Worker donde está desplegada
+            - Interfaces de red
+            - Estado actual y configuración VNC
+            
+        Códigos de respuesta:
+            200: VM encontrada y acceso permitido
+            400: ID inválido o falta user_id
+            403: Usuario no autorizado
+            404: VM no encontrada
+            500: Error interno
+    """
+    try:
+        Logger.major_section(f"API: GET VM ID-{vm_id}")
+        vm_id = int(vm_id)
+
+        # 1. Validar user_id 
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
+            return jsonify({
+                "status": "error",
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
+
+        # 2. Verificar VM y acceso del usuario mediante property
+        Logger.debug(f"Verificando acceso del usuario {user_id} a VM {vm_id}")
+        access_query = """
+            SELECT 
+                vm.*,
+                s.id as slice_id, s.name as slice_name,
+                p.user as property_user,
+                ps.name as worker_name, ps.ip as worker_ip,
+                f.name as flavor_name, f.vcpus, f.ram, f.disk,
+                i.name as image_name, i.path as image_path,
+                u.username
+            FROM virtual_machine vm
+            JOIN slice s ON vm.slice = s.id
+            JOIN property p ON s.id = p.slice
+            JOIN physical_server ps ON vm.physical_server = ps.id
+            JOIN flavor f ON vm.flavor = f.id
+            JOIN image i ON vm.image = i.id
+            JOIN user u ON p.user = u.id
+            WHERE vm.id = %s AND p.user = %s
+        """
+
+        vm_info = db.execute_query(access_query, (vm_id, user_id))
+
+        if not vm_info:
+            # Verificar si la VM existe
+            vm_exists = db.execute_query(
+                "SELECT id FROM virtual_machine WHERE id = %s",
+                (vm_id,)
+            )
+            
+            if vm_exists:
+                Logger.warning(f"Usuario {user_id} no tiene acceso a VM {vm_id}")
+                return jsonify({
+                    "status": "error",
+                    "message": "No autorizado",
+                    "details": "No tienes permiso para acceder a esta máquina virtual"
+                }), 403
+            else:
+                Logger.warning(f"VM {vm_id} no encontrada")
+                return jsonify({
+                    "status": "error",
+                    "message": "La máquina virtual no existe",
+                    "details": f"No se encontró la VM con ID {vm_id}"
+                }), 404
+
+        vm = vm_info[0]
+        Logger.info(f"VM encontrada: ID-{vm_id}, Nombre: {vm['name']}")
+
+        # 3. Obtener interfaces de red
+        Logger.debug("Consultando interfaces de red")
+        interfaces_query = """
+            SELECT id, name, mac, ip, link, external_access, tap_name
+            FROM interface 
+            WHERE vm = %s
+            ORDER BY external_access DESC, id
+        """
+        interfaces = db.execute_query(interfaces_query, (vm_id,))
+        Logger.debug(f"Interfaces encontradas: {len(interfaces)}")
+
+        # 4. Estructurar respuesta
+        vm_data = {
+            "vm_info": {
+                "id": vm['id'],
+                "name": vm['name'],
+                "status": vm['status'],
+                "qemu_pid": vm['qemu_pid'],
+                "vnc_display": vm['vnc_display'],
+                "vnc_port": vm['vnc_port']
+            },
+            "slice": {
+                "id": vm['slice_id'],
+                "name": vm['slice_name']
+            },
+            "resources": {
+                "flavor": {
+                    "id": vm['flavor'],
+                    "name": vm['flavor_name'],
+                    "vcpus": vm['vcpus'],
+                    "ram": vm['ram'],
+                    "disk": vm['disk']
+                },
+                "image": {
+                    "id": vm['image'],
+                    "name": vm['image_name'],
+                    "path": vm['image_path']
+                }
+            },
+            "worker": {
+                "id": vm['physical_server'],
+                "name": vm['worker_name'],
+                "ip": vm['worker_ip']
+            },
+            "interfaces": [{
+                "id": iface['id'],
+                "name": iface['name'],
+                "mac_address": iface['mac'],
+                "ip": iface['ip'],
+                "link_id": iface['link'],
+                "external_access": bool(iface['external_access']),
+                "tap_name": iface['tap_name']
+            } for iface in interfaces],
+            "user": {
+                "id": int(user_id),
+                "username": vm['username']
+            }
+        }
+
+        Logger.success(f"Información de VM ID-{vm_id} obtenida exitosamente")
+        return jsonify({
+            "status": "success",
+            "message": f"Información de la VM '{vm['name']}' obtenida exitosamente",
+            "content": vm_data
+        }), 200
+
+    except ValueError:
+        Logger.error(f"ID de VM inválido: {vm_id}")
+        return jsonify({
+            "status": "error",
+            "message": "El ID de la máquina virtual es inválido",
+            "details": "El ID debe ser un número entero"
+        }), 400
+    except Exception as e:
+        Logger.error(f"Error obteniendo VM: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error interno al obtener información de la VM",
+            "details": str(e)
+        }), 500
+
 @app.route('/list-slices', methods=['GET'])
 def list_slices():
     """
     Obtiene todos los slices a los que tiene acceso un usuario.
     
     Query params:
-        user_id (required): ID del usuario
+        
 
     Returns:
         Response: Lista de slices con recursos y estado
@@ -3187,15 +3834,60 @@ def list_slices():
     try:
         Logger.major_section("API: LIST USER SLICES")
         
-        # Validar user_id
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # Obtener y validar token
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # Consultar slices del usuario a través de la tabla property
         Logger.debug(f"Consultando slices para usuario ID-{user_id}")
@@ -3285,7 +3977,7 @@ def get_flavors():
     try:
         Logger.major_section("API: GET FLAVORS")
         
-        # Obtener user_id de query params
+        # Obtener user_id 
         user_id = request.args.get('user_id')
         Logger.debug(f"User ID: {user_id if user_id else 'No proporcionado'}")
         
@@ -3348,7 +4040,7 @@ def get_images():
     try:
         Logger.major_section("API: GET IMAGES")
         
-        # Obtener user_id de query params
+        # Obtener user_id
         user_id = request.args.get('user_id')
         Logger.debug(f"User ID: {user_id if user_id else 'No proporcionado'}")
         
@@ -3470,73 +4162,73 @@ def get_available_vnc_displays():
             "details": str(e)
         }), 500
 
-@app.route('/vm-vnc/<vm_id>')
-def vm_vnc(vm_id):
-    """
-    Endpoint para acceder a la consola VNC de una VM.
+# @app.route('/vm-vnc/<vm_id>')
+# def vm_vnc(vm_id):
+#     """
+#     Endpoint para acceder a la consola VNC de una VM.
     
-    Args:
-        vm_id (str): ID de la VM
-        token (query param): Token JWT de autenticación
+#     Args:
+#         vm_id (str): ID de la VM
+#         token (query param): Token JWT de autenticación
         
-    Returns:
-        Response: Página HTML con cliente VNC o error
-            200: Template VNC renderizado
-            403: Token inválido
-            404: VM no encontrada
-            500: Error interno
-    """
-    try:
-        Logger.major_section(f"VNC CONSOLE VM ID-{vm_id}")
+#     Returns:
+#         Response: Página HTML con cliente VNC o error
+#             200: Template VNC renderizado
+#             403: Token inválido
+#             404: VM no encontrada
+#             500: Error interno
+#     """
+#     try:
+#         Logger.major_section(f"VNC CONSOLE VM ID-{vm_id}")
         
-        # Verificar token
-        Logger.debug("Validando token de acceso")
-        Logger.debug(f"Request: {request.args}")
-        token = request.args.get('token')
-        Logger.debug(f"Token: {token}")
-        if not token or not vnc_token_manager.validate_token(token, int(vm_id)):
-            Logger.warning(f"Token inválido o expirado para VM ID-{vm_id}")
-            return jsonify({
-                "status": "error",
-                "message": "Acceso denegado",
-                "details": "El token de acceso es inválido o ha expirado"
-            }), 403
+#         # Verificar token
+#         Logger.debug("Validando token de acceso")
+#         Logger.debug(f"Request: {request.args}")
+#         token = request.args.get('token')
+#         Logger.debug(f"Token: {token}")
+#         if not token or not vnc_token_manager.validate_token(token, int(vm_id)):
+#             Logger.warning(f"Token inválido o expirado para VM ID-{vm_id}")
+#             return jsonify({
+#                 "status": "error",
+#                 "message": "Acceso denegado",
+#                 "details": "El token de acceso es inválido o ha expirado"
+#             }), 403
             
-        # Obtener información de la VM
-        Logger.debug("Consultando información de VM")
-        vm_info = db.execute_query(
-            """SELECT vm.*, ps.name as worker_name 
-               FROM virtual_machine vm
-               JOIN physical_server ps ON vm.physical_server = ps.id
-               WHERE vm.id = %s""",
-            (vm_id,)
-        )
+#         # Obtener información de la VM
+#         Logger.debug("Consultando información de VM")
+#         vm_info = db.execute_query(
+#             """SELECT vm.*, ps.name as worker_name 
+#                FROM virtual_machine vm
+#                JOIN physical_server ps ON vm.physical_server = ps.id
+#                WHERE vm.id = %s""",
+#             (vm_id,)
+#         )
         
-        if not vm_info:
-            Logger.warning(f"VM ID-{vm_id} no encontrada")
-            return jsonify({
-                "status": "error",
-                "message": "La máquina virtual solicitada no existe",
-                "details": f"No se encontró la VM con ID {vm_id}"
-            }), 404
+#         if not vm_info:
+#             Logger.warning(f"VM ID-{vm_id} no encontrada")
+#             return jsonify({
+#                 "status": "error",
+#                 "message": "La máquina virtual solicitada no existe",
+#                 "details": f"No se encontró la VM con ID {vm_id}"
+#             }), 404
             
-        vm = vm_info[0]
-        Logger.info(f"Renderizando cliente VNC para VM ID-{vm_id} con nombre '{vm['name']}'")
+#         vm = vm_info[0]
+#         Logger.info(f"Renderizando cliente VNC para VM ID-{vm_id} con nombre '{vm['name']}'")
         
-        return render_template('vnc.html', 
-            vm_id=vm_id, 
-            vm_name=vm['name'], 
-            token=token
-        )
+#         return render_template('vnc.html', 
+#             vm_id=vm_id, 
+#             vm_name=vm['name'], 
+#             token=token
+#         )
         
-    except Exception as e:
-        Logger.error(f"Error accediendo a VNC: {str(e)}")
-        Logger.debug(f"Traceback: {traceback.format_exc()}")
-        return jsonify({
-            "status": "error",
-            "message": f"Error al acceder a la consola VNC de la VM con nombre '{vm['name']}'",
-            "details": str(e)
-        }), 500
+#     except Exception as e:
+#         Logger.error(f"Error accediendo a VNC: {str(e)}")
+#         Logger.debug(f"Traceback: {traceback.format_exc()}")
+#         return jsonify({
+#             "status": "error",
+#             "message": f"Error al acceder a la consola VNC de la VM con nombre '{vm['name']}'",
+#             "details": str(e)
+#         }), 500
 
 @app.route('/vm-token/<vm_id>', methods=['POST'])
 def generate_vnc_token(vm_id):
@@ -3557,15 +4249,60 @@ def generate_vnc_token(vm_id):
         Logger.major_section(f"API: GENERATE VNC TOKEN VM ID-{vm_id}")
         vm_id = int(vm_id)
 
-        # 1. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 1. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 2. Verificar VM y acceso del usuario
         Logger.debug(f"Verificando acceso del usuario {user_id} a VM {vm_id}")
@@ -3802,6 +4539,15 @@ def create_sketch():
         request_data = request.get_json()
         Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
+            return jsonify({
+                "status": "error",
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+        
         # 1. Validar campos requeridos
         required_fields = ['name', 'user_id', 'topology_info']
         for field in required_fields:
@@ -3920,14 +4666,59 @@ def get_sketch(sketch_id):
         Logger.major_section(f"API: GET SKETCH ID-{sketch_id}")
 
         # Validar user_id
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # Consultar sketch con validación de usuario
         Logger.debug(f"Consultando sketch ID-{sketch_id} para usuario {user_id}")
@@ -4013,14 +4804,59 @@ def delete_sketch(sketch_id):
         Logger.major_section(f"API: DELETE SKETCH ID-{sketch_id}")
 
         # Validar user_id
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # Verificar si el sketch existe y pertenece al usuario
         Logger.debug(f"Verificando sketch ID-{sketch_id} para usuario {user_id}")
@@ -4081,7 +4917,7 @@ def update_sketch(sketch_id):
 
     Args:
         sketch_id (int): ID del sketch a actualizar
-        user_id (query param): ID del usuario que intenta actualizar
+        
 
     Request body:
     {
@@ -4107,15 +4943,60 @@ def update_sketch(sketch_id):
         request_data = request.get_json()
         Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
-        # 1. Validar user_id en query params
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        # 1. Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # 2. Verificar si el sketch existe y pertenece al usuario
         Logger.debug(f"Verificando permisos para usuario {user_id}")
@@ -4263,7 +5144,7 @@ def list_sketches():
     Obtiene todos los sketches de un usuario específico.
     
     Query params:
-        user_id (required): ID del usuario
+        
 
     Returns:
         Response: Lista de sketches del usuario
@@ -4275,14 +5156,59 @@ def list_sketches():
         Logger.major_section("API: LIST USER SKETCHES")
         
         # Validar user_id
-        user_id = request.args.get('user_id')
-        if not user_id:
-            Logger.error("No se proporcionó user_id")
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
             return jsonify({
                 "status": "error",
-                "message": "Falta el ID del usuario",
-                "details": "El parámetro user_id es requerido"
-            }), 400
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+            
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+            
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+            
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error", 
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener user_id del query param si existe
+        query_user_id = request.args.get('user_id')
+        if query_user_id:
+            query_user_id = int(query_user_id)
+            
+            # Si el user_id del query es diferente al del token, verificar si es Admin
+            if query_user_id != token_user_id:
+                if role != 'Admin':
+                    Logger.warning(f"Usuario {token_user_id} intentó acceder a slices del usuario {query_user_id}")
+                    return jsonify({
+                        "status": "error",
+                        "message": "No autorizado",
+                        "details": "Solo los administradores pueden ver slices de otros usuarios"
+                    }), 403
+                Logger.debug(f"Admin {token_user_id} accediendo a slices del usuario {query_user_id}")
+                user_id = query_user_id
+            else:
+                user_id = token_user_id
+        else:
+            user_id = token_user_id
 
         # Consultar sketches del usuario
         Logger.debug(f"Consultando sketches del usuario {user_id}")
@@ -4345,6 +5271,11 @@ if __name__ == '__main__':
         Logger.debug("Inicializando gestor de tokens VNC...")
         vnc_token_manager = VNCTokenManager()
         Logger.success("Gestor de tokens VNC inicializado")
+
+        # Gestor de tokens JWT del Usuario
+        Logger.debug("Inicializando gestor de tokens JWT...")
+        jwt_manager = JWTManager()
+        Logger.success("Gestor de tokens JWT inicializado")
         
         # Configuración del servidor
         host = '0.0.0.0'
