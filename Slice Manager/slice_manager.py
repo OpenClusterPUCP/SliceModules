@@ -97,6 +97,45 @@ eureka_client.init(
     duration_in_secs=90,
 )
 
+def get_service_instance(service_name: str) -> dict:
+    """
+    Obtiene información de la instancia de un servicio registrado en Eureka.
+    
+    Args:
+        service_name (str): Nombre del servicio registrado en Eureka
+        
+    Returns:
+        dict: Información de la instancia con host y puerto, o None si no se encuentra
+        
+    Example:
+        instance = get_service_instance('slice-manager')
+        url = f"http://{instance['ipAddr']}:{instance['port']}/endpoint"
+    """
+    try:
+        Logger.debug(f"Buscando instancia de servicio: {service_name}")
+        
+        # Obtener instancia a través del cliente Eureka
+        instance = eureka_client.get_client().applications.get_application(service_name)
+        if not instance or not instance.up_instances:
+            Logger.error(f"Servicio {service_name} no encontrado en Eureka")
+            return None
+            
+        # Obtener primera instancia disponible
+        instance = instance.up_instances[0]
+        
+        service_info = {
+            'ipAddr': instance.ipAddr,
+            'port': instance.port.port,
+            'hostName': instance.hostName
+        }
+        
+        Logger.debug(f"Instancia encontrada: {json.dumps(service_info, indent=2)}")
+        return service_info
+        
+    except Exception as e:
+        Logger.error(f"Error obteniendo instancia de {service_name}: {str(e)}")
+        return None
+
 
 # ===================== CONFIGURACIÓN BD =====================
 DB_CONFIG = {
@@ -1909,8 +1948,12 @@ def deploy_slice():
         # 6. Enviar a Slice Controller para despliegue
         Logger.subsection("Enviando configuración a Slice Controller")
         try:
+            slice_controller = get_service_instance('slice-controller')
+            if not slice_controller:
+                raise Exception("Servicio slice-controller no disponible")
+
             server_response = requests.post(
-                'http://localhost:5000/deploy-slice',
+                f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/deploy-slice",
                 json=json.loads(json.dumps(processed_config, default=json_handler)),
                 timeout=300
             )
@@ -2176,8 +2219,12 @@ def pause_vm_endpoint(vm_id: str):
         
         # 3. Enviar solicitud a Slice Controller
         Logger.info("Enviando solicitud de pausa al servidor de despliegue")
+        slice_controller = get_service_instance('slice-controller')
+        if not slice_controller:
+            raise Exception("Servicio slice-controller no disponible") 
+
         response = requests.post(
-            f'http://localhost:5000/pause-vm/{vm_id}',
+            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/pause-vm/{vm_id}",
             json=pause_data,
             timeout=300
         )
@@ -2427,8 +2474,12 @@ def resume_vm_endpoint(vm_id: str):
         
         # 5. Enviar solicitud a Slice Controller
         Logger.info("Enviando solicitud de reanudación al servidor de despliegue")
+        slice_controller = get_service_instance('slice-controller')
+        if not slice_controller:
+            raise Exception("Servicio slice-controller no disponible") 
+
         response = requests.post(
-            f'http://localhost:5000/resume-vm/{vm_id}',
+            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/resume-vm/{vm_id}",
             json=json.loads(json.dumps(resume_data, default=json_handler)),
             timeout=300
         )
@@ -2669,8 +2720,12 @@ def restart_vm_endpoint(vm_id: str):
 
         # 3. Enviar solicitud a Slice Controller
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
+        slice_controller = get_service_instance('slice-controller')
+        if not slice_controller:
+            raise Exception("Servicio slice-controller no disponible") 
+
         response = requests.post(
-            f'http://localhost:5000/restart-vm/{vm_id}',
+            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-vm/{vm_id}",
             json=json.loads(json.dumps(restart_data, default=json_handler)),
             timeout=300
         )
@@ -2974,8 +3029,12 @@ def restart_slice_endpoint(slice_id: str):
 
         # 5. Enviar request a Slice Controller
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
+        slice_controller = get_service_instance('slice-controller')
+        if not slice_controller:
+            raise Exception("Servicio slice-controller no disponible") 
+
         response = requests.post(
-            f'http://localhost:5000/restart-slice/{slice_id}',
+            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-slice/{slice_id}",
             json=json.loads(json.dumps(restart_data, default=str)),
             timeout=300
         )
@@ -3256,8 +3315,12 @@ def stop_slice_endpoint(slice_id: str):
 
         # 3. Enviar request a Slice Controller
         Logger.info("Enviando solicitud de detención al servidor de despliegue")
+        slice_controller = get_service_instance('slice-controller')
+        if not slice_controller:
+            raise Exception("Servicio slice-controller no disponible") 
+
         response = requests.post(
-            f'http://localhost:5000/stop-slice/{slice_id}',
+            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/stop-slice/{slice_id}",
             json=stop_data,
             timeout=300
         )

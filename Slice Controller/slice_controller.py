@@ -47,6 +47,7 @@
 
 # ===================== IMPORTACIONES =====================
 from flask import Flask, request, jsonify, render_template
+from py_eureka_client import eureka_client
 from flask_cors import CORS
 from flask_sock import Sock
 import paramiko
@@ -77,6 +78,57 @@ sock = Sock(app)
 CORS(app)
 
 
+# ===================== CONFIGURACIÓN DE EUREKA =====================
+eureka_server = "http://localhost:8761"
+
+eureka_client.init(
+    eureka_server=eureka_server,
+    app_name="slice-controller",
+    instance_port=5000,
+    instance_host="localhost",    
+    renewal_interval_in_secs=30,
+    duration_in_secs=90,
+)
+
+def get_service_instance(service_name: str) -> dict:
+    """
+    Obtiene información de la instancia de un servicio registrado en Eureka.
+    
+    Args:
+        service_name (str): Nombre del servicio registrado en Eureka
+        
+    Returns:
+        dict: Información de la instancia con host y puerto, o None si no se encuentra
+        
+    Example:
+        instance = get_service_instance('slice-manager')
+        url = f"http://{instance['ipAddr']}:{instance['port']}/endpoint"
+    """
+    try:
+        Logger.debug(f"Buscando instancia de servicio: {service_name}")
+        
+        # Obtener instancia a través del cliente Eureka
+        instance = eureka_client.get_client().applications.get_application(service_name)
+        if not instance or not instance.up_instances:
+            Logger.error(f"Servicio {service_name} no encontrado en Eureka")
+            return None
+            
+        # Obtener primera instancia disponible
+        instance = instance.up_instances[0]
+        
+        service_info = {
+            'ipAddr': instance.ipAddr,
+            'port': instance.port.port,
+            'hostName': instance.hostName
+        }
+        
+        Logger.debug(f"Instancia encontrada: {json.dumps(service_info, indent=2)}")
+        return service_info
+        
+    except Exception as e:
+        Logger.error(f"Error obteniendo instancia de {service_name}: {str(e)}")
+        return None
+    
 # ===================== CONSTANTES =====================
 # Directorio de trabajo principal
 WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1704,8 +1756,14 @@ class SliceManager:
             worker_ids = [vm['physical_server']['id'] for vm in request_data['vms']]
             Logger.debug(f"Worker IDs solicitados: {worker_ids}")
             
+            # Obtener display VNC
+            slice_manager = get_service_instance('slice-manager')
+            if not slice_manager:
+                raise Exception("Servicio slice-manager no disponible")
+            
+            Logger.info("Obteniendo displays VNC...")
             vnc_response = requests.post(
-                'http://localhost:5001/get-available-vnc-displays',
+                f"http://{slice_manager['ipAddr']}:{slice_manager['port']}/get-available-vnc-displays",
                 json={'worker_ids': worker_ids}
             )
 
@@ -1987,9 +2045,13 @@ class SliceManager:
                 raise Exception("Información de flavor incompleta o no proporcionada")
 
             # Obtener display VNC
+            slice_manager = get_service_instance('slice-manager')
+            if not slice_manager:
+                raise Exception("Servicio slice-manager no disponible")
+            
             Logger.info("Obteniendo display VNC...")
             vnc_response = requests.post(
-                'http://localhost:5001/get-available-vnc-displays',
+                f"http://{slice_manager['ipAddr']}:{slice_manager['port']}/get-available-vnc-displays",
                 json={'worker_ids': [worker_info['id']]}
             )
 
