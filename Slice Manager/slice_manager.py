@@ -666,7 +666,8 @@ class WorkerAssigner:
                 """SELECT id, name 
                    FROM physical_server 
                    WHERE server_type = 'worker' 
-                   AND status = 'active'"""
+                   AND status = 'active'
+                   LIMIT 3""" # Temporal para pruebas, ya que solo usamos los workers de un mismo slice!
             )
             Logger.info(f"Workers activos encontrados: {len(workers)}")
             Logger.debug(f"Workers: {[w['name'] for w in workers]}")
@@ -743,26 +744,7 @@ class WorkerAssigner:
     def assign_workers_and_displays(self, vms: List[Dict]) -> Dict[int, Dict]:
         """
         Asigna workers y displays VNC a las VMs usando round-robin.
-        
-        Distribuye las VMs entre los workers activos de forma balanceada
-        y asigna un display VNC único a cada VM.
-        
-        Args:
-            vms (List[Dict]): Lista de VMs a asignar
-                [{"id": int, "name": str, ...}, ...]
-                
-        Returns:
-            Dict[int, Dict]: Asignaciones por VM
-                {
-                    vm_id: {
-                        "worker": {"id": int, "name": str},
-                        "vnc_display": int
-                    },
-                    ...
-                }
-                
-        Raises:
-            Exception: Si no hay workers disponibles o displays VNC
+        Asegura que cada VM en un mismo worker tenga un display VNC único.
         """
         try:
             Logger.section(f"Asignando workers y displays para {len(vms)} VMs")
@@ -775,24 +757,50 @@ class WorkerAssigner:
             
             Logger.info(f"Workers disponibles: {len(workers)}")
             
-            # Obtener displays disponibles por worker
-            available_displays = {}
+            # Diccionario para rastrear displays usados por worker
+            worker_displays_used = {}
+            worker_available_displays = {}
+            
+            # Inicializar displays disponibles por worker
             for worker in workers:
-                displays = self.get_worker_vnc_displays(worker['id'])
-                available_displays[worker['id']] = displays
-                Logger.debug(f"Worker {worker['name']}: {len(displays)} displays disponibles")
+                worker_id = worker['id']
+                displays = self.get_worker_vnc_displays(worker_id)
+                worker_available_displays[worker_id] = displays
+                worker_displays_used[worker_id] = set()
+                Logger.debug(f"Worker {worker['name']} (ID-{worker_id}): {len(displays)} displays disponibles")
+                Logger.debug(f"Displays disponibles: {displays[:5]}...")
 
             # Asignar VMs usando round-robin
             assignments = {}
+            assigned_workers = []  # Para mantener el orden de asignación
+
             for i, vm in enumerate(vms):
+                # Seleccionar worker por round-robin
                 worker = workers[i % len(workers)]
-                worker_displays = available_displays[worker['id']]
+                worker_id = worker['id']
+                assigned_workers.append(worker['name'])
                 
-                if not worker_displays:
+                Logger.debug(f"\nAsignando VM-{vm['id']}:")
+                Logger.debug(f"- Worker seleccionado: {worker['name']} (ID-{worker_id})")
+                Logger.debug(f"- Displays ya usados en este worker: {worker_displays_used[worker_id]}")
+                
+                # Obtener siguiente display disponible para este worker
+                available_displays = worker_available_displays[worker_id]
+                used_displays = worker_displays_used[worker_id]
+                
+                # Encontrar el primer display disponible que no esté en uso
+                display = None
+                for d in available_displays:
+                    if d not in used_displays:
+                        display = d
+                        used_displays.add(d)  # Marcar como usado
+                        Logger.debug(f"- Display asignado: {display}")
+                        break
+                        
+                if display is None:
                     Logger.error(f"No hay displays VNC disponibles en worker {worker['name']}")
                     raise Exception(f"No hay displays VNC disponibles en worker {worker['name']}")
                 
-                display = worker_displays.pop(0)
                 assignments[vm['id']] = {
                     'worker': {
                         'id': worker['id'],
@@ -801,15 +809,24 @@ class WorkerAssigner:
                     'vnc_display': display
                 }
                 
-                Logger.info(f"VM ID-{vm.get('name', vm['id'])} asignada a Worker ID-{worker['id']} con nombre '{worker['name']}' y Display N°{display}")
+                Logger.info(
+                    f"VM ID-{vm['id']} asignada a Worker con nombre {worker['name']} (ID-{worker_id}) con Display N°{display}"
+                )
+
+            # Resumen de asignaciones
+            Logger.info("\nResumen de asignaciones:")
+            Logger.info(f"Workers utilizados en orden: {', '.join(assigned_workers)}")
+            for worker_id, used_set in worker_displays_used.items():
+                worker_name = next(w['name'] for w in workers if w['id'] == worker_id)
+                Logger.info(f"Worker {worker_name} (ID-{worker_id}) - Displays asignados: {sorted(used_set)}")
 
             Logger.success(f"Asignación completada: {len(assignments)} VMs distribuidas")
             return assignments
-            
+                
         except Exception as e:
             Logger.error(f"Error en assign_workers_and_displays: {str(e)}")
             raise
-
+    
 class SliceProcessor:
     """
     Procesador de solicitudes y recursos para slices.

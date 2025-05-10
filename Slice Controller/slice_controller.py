@@ -1705,7 +1705,7 @@ class SliceManager:
             Logger.debug(f"Worker IDs solicitados: {worker_ids}")
             
             vnc_response = requests.post(
-                'http://127.0.0.1:5001/get-available-vnc-displays',
+                'http://localhost:5001/get-available-vnc-displays',
                 json={'worker_ids': worker_ids}
             )
 
@@ -1989,7 +1989,7 @@ class SliceManager:
             # Obtener display VNC
             Logger.info("Obteniendo display VNC...")
             vnc_response = requests.post(
-                'http://127.0.0.1:5001/get-available-vnc-displays',
+                'http://localhost:5001/get-available-vnc-displays',
                 json={'worker_ids': [worker_info['id']]}
             )
 
