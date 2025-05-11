@@ -1572,7 +1572,7 @@ class SliceProcessor:
 
                 if iface.get('external_access', False):
                     new_link_id = None
-                    iface['tap_name'] = f"tapx-VM{new_vm_id}-S{slice_id}"
+                    iface['tap_name'] = f"tx-V{new_vm_id}-S{slice_id}"
                     iface['external_access'] = True
                 else:
                     new_link_id = link_id_mapping.get(old_link_id)
@@ -1580,7 +1580,7 @@ class SliceProcessor:
                         Logger.error(f"Link ID {old_link_id} no encontrado para interfaz {iface['name']}")
                         raise Exception(f"Link ID {old_link_id} no encontrado para la interfaz {iface['name']}")
                     
-                    iface['tap_name'] = f"tap-VM{new_vm_id}-S{slice_id}-{vm_interface_counters[new_vm_id]}"
+                    iface['tap_name'] = f"t-V{new_vm_id}-S{slice_id}-{vm_interface_counters[new_vm_id]}"
                     iface['external_access'] = False
                     vm_interface_counters[new_vm_id] += 1
 
@@ -1849,6 +1849,22 @@ def deploy_slice():
                     "details": f"El campo '{field}' es requerido en slice_info"
                 }), 400
 
+        if len(slice_info['name']) > 45:
+            Logger.error("Nombre de slice excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Nombre de slice inválido",
+                "details": "El nombre debe tener máximo 45 caracteres"
+            }), 400
+
+        if len(slice_info['description']) > 1000:
+            Logger.error("Descripción de slice excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Descripción de slice inválida",
+                "details": "La descripción debe tener máximo 1000 caracteres"
+            }), 400
+
         user_id = slice_info['user_id']
         sketch_id = slice_info['sketch_id']
 
@@ -1873,25 +1889,27 @@ def deploy_slice():
         sketch = sketch_data[0]
         structure = json.loads(sketch['structure'])
         
-        # 3. Validar acceso a recursos
+        # 3. Validar acceso a recursos y límites
         Logger.debug("Validando acceso a recursos...")
         topology = structure['topology_info']
-        
-        # Obtener IDs únicos
+
+        # 3.1 Validar acceso a recursos (flavors e images)
         flavor_ids = {str(vm['flavor_id']) for vm in topology.get('vms', [])}
         image_ids = {str(vm['image_id']) for vm in topology.get('vms', [])}
 
         # Verificar flavors - públicos o del usuario
         Logger.debug(f"Verificando flavors: {flavor_ids}")
         valid_flavors = db.execute_query(
-            """SELECT id FROM flavor 
-               WHERE id IN (%s) 
-               AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+            """SELECT id, vcpus, ram, disk 
+            FROM flavor 
+            WHERE id IN (%s) 
+            AND state = 'active'
+            AND (user IS NULL OR user = %s)""" % 
             (','.join(flavor_ids) if flavor_ids else 'NULL', user_id)
         )
         valid_flavor_ids = {str(f['id']) for f in valid_flavors}
-        
+        flavor_resources = {str(f['id']): f for f in valid_flavors}
+
         invalid_flavors = flavor_ids - valid_flavor_ids
         if invalid_flavors:
             Logger.error(f"Flavors inválidos o no accesibles: {invalid_flavors}")
@@ -1905,13 +1923,13 @@ def deploy_slice():
         Logger.debug(f"Verificando images: {image_ids}")
         valid_images = db.execute_query(
             """SELECT id FROM image 
-               WHERE id IN (%s) 
-               AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+            WHERE id IN (%s) 
+            AND state = 'active'
+            AND (user IS NULL OR user = %s)""" % 
             (','.join(image_ids) if image_ids else 'NULL', user_id)
         )
         valid_image_ids = {str(i['id']) for i in valid_images}
-        
+
         invalid_images = image_ids - valid_image_ids
         if invalid_images:
             Logger.error(f"Images inválidas o no accesibles: {invalid_images}")
@@ -1920,6 +1938,65 @@ def deploy_slice():
                 "message": "Algunas imágenes no son válidas o no tienes acceso a ellas",
                 "details": f"Las siguientes imágenes no existen, no están activas o no tienes permiso: {list(invalid_images)}"
             }), 400
+
+        # 3.2 Verificar límites de recursos del usuario
+        Logger.debug("Verificando límites de recursos del usuario")
+        resource_query = """
+            SELECT vcpus, ram, disk, slices,
+                used_vcpus, used_ram, used_disk, used_slices
+            FROM resource 
+            WHERE user = %s
+        """
+        user_resources = db.execute_query(resource_query, (user_id,))
+
+        if not user_resources:
+            Logger.error(f"No se encontraron recursos asignados para el usuario {user_id}")
+            return jsonify({
+                "status": "error",
+                "message": "No tienes recursos asignados",
+                "details": "Contacta al administrador para solicitar recursos"
+            }), 403
+
+        resources = user_resources[0]
+
+        # Calcular recursos requeridos
+        required_vcpus = 0
+        required_ram = 0
+        required_disk = 0
+
+        for vm in topology.get('vms', []):
+            flavor = flavor_resources[str(vm['flavor_id'])]
+            required_vcpus += flavor['vcpus']
+            required_ram += flavor['ram']
+            required_disk += flavor['disk']
+
+        
+        # Verificar disponibilidad
+        available_vcpus = resources['vcpus'] - resources['used_vcpus']
+        available_ram = resources['ram'] - resources['used_ram']
+        available_disk = round(float(resources['disk']) - float(resources['used_disk']),1)
+        available_slices = resources['slices'] - resources['used_slices']
+
+        errors = []
+        if required_vcpus > available_vcpus:
+            errors.append(f"vCPUs de usuario insuficientes (requerido: {required_vcpus}, disponible: {available_vcpus})")
+        if required_ram > available_ram:
+            errors.append(f"RAM de usuario insuficiente (requerido: {required_ram}MB, disponible: {available_ram}MB)")
+        if required_disk > available_disk:
+            errors.append(f"Almacenamiento de usuario insuficiente (requerido: {required_disk}GB, disponible: {available_disk}GB)")
+        if available_slices < 1:
+            errors.append(f"Límite de slices en ejecución de usuario alcanzado (máximo: {resources['slices']})")
+
+        if errors:
+            Logger.error("Recursos insuficientes para desplegar slice")
+            return jsonify({
+                "status": "error",
+                "message": "No tienes suficientes recursos disponibles. Contacta al administrador para solicitar más recursos",
+                "details": errors
+            }), 403
+
+        Logger.success("Validación de recursos completada")
+
 
         # 4. Construir configuración para despliegue
         Logger.debug("Preparando configuración para despliegue")
@@ -1980,7 +2057,7 @@ def deploy_slice():
             return jsonify({
                 "status": "error",
                 "message": "El servidor de despliegue reportó un error",
-                "details": server_response.text
+                "details": server_response.json()['details']
             }), server_response.status_code
 
         # 7. Procesar respuesta y actualizar configuración
@@ -2042,6 +2119,25 @@ def deploy_slice():
                 (property_query, (user_id, slice_id))
             ])
             Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
+
+            # Actualizar recursos usados
+            Logger.debug("Actualizando recursos usados del usuario")
+            update_resources_query = """
+                UPDATE resource
+                SET used_vcpus = used_vcpus + %s,
+                    used_ram = used_ram + %s,
+                    used_disk = used_disk + %s,
+                    used_slices = used_slices + 1
+                WHERE user = %s
+            """
+
+            db.execute_transaction([
+                (update_resources_query, (required_vcpus, required_ram, required_disk, user_id))
+            ])
+
+            Logger.debug(f"Recursos actualizados - vCPUs: +{required_vcpus}, RAM: +{required_ram}MB, Disk: +{required_disk}GB")
+            Logger.success(f"Recursos del usuario {user_id} actualizados exitosamente")
+
 
         except Exception as e:
             Logger.error(f"Error guardando configuración: {str(e)}")
@@ -3232,10 +3328,14 @@ def stop_slice_endpoint(slice_id: str):
                 vm.status as vm_status, vm.qemu_pid,
                 ps.id as worker_id, ps.name as worker_name, 
                 ps.ip as worker_ip,
-                ps.ssh_username, ps.ssh_password, ps.ssh_key_path
+                ps.ssh_username, ps.ssh_password, ps.ssh_key_path,
+                i.id as interface_id, i.name as interface_name,
+                i.mac as interface_mac, i.tap_name,
+                i.external_access
             FROM slice s
             JOIN virtual_machine vm ON vm.slice = s.id
             JOIN physical_server ps ON vm.physical_server = ps.id
+            LEFT JOIN interface i ON i.vm = vm.id
             WHERE s.id = %s AND vm.status = 'running'
         """
         
@@ -3268,6 +3368,7 @@ def stop_slice_endpoint(slice_id: str):
             },
             "vms": [],
             "workers": {},
+            "interfaces": [],
             "network_config":{
                 "slice_id": slice_id,
                 "svlan_id": slice_network_info[0]['svlan_id'],
@@ -3286,33 +3387,55 @@ def stop_slice_endpoint(slice_id: str):
             }
         }
 
+        interfaces_by_vm = {}
+
         # Procesar información de VMs y workers
         for row in result:
-            # Agregar VM con su worker asociado
-            vm_data = {
-                "id": row['vm_id'],
-                "name": row['vm_name'],
-                "status": row['vm_status'],
-                "qemu_pid": row['qemu_pid'],
-                "physical_server": {
-                    "id": row['worker_id'],
-                    "name": row['worker_name']
+            # Agrupar interfaces por VM
+            if row['interface_id']:
+                if row['vm_id'] not in interfaces_by_vm:
+                    interfaces_by_vm[row['vm_id']] = []
+                    
+                interface_data = {
+                    "id": row['interface_id'],
+                    "name": row['interface_name'],
+                    "vm_id": row['vm_id'],  # Agregamos el vm_id
+                    "mac_address": row['interface_mac'],
+                    "tap_name": row['tap_name'],
+                    "external_access": row['external_access']
                 }
-            }
-            stop_data['vms'].append(vm_data)
-            Logger.debug(f"VM procesada: Nombre: {vm_data['name']}, ID: {vm_data['id']}")
+                interfaces_by_vm[row['vm_id']].append(interface_data)
+                
+                # Agregar a la lista general de interfaces
+                stop_data['interfaces'].append(interface_data)
 
-            # Agregar worker si no existe
-            if str(row['worker_id']) not in stop_data['workers']:
-                stop_data['workers'][str(row['worker_id'])] = {
-                    "name": row['worker_name'],
-                    "ip": row['worker_ip'],
-                    "ssh_username": row['ssh_username'],
-                    "ssh_password": row['ssh_password'],
-                    "ssh_key_path": row['ssh_key_path']
+            # Solo procesar VM y worker una vez
+            if row['vm_id'] not in [vm['id'] for vm in stop_data['vms']]:
+                # Agregar VM con su worker asociado
+                vm_data = {
+                    "id": row['vm_id'],
+                    "name": row['vm_name'],
+                    "status": row['vm_status'],
+                    "qemu_pid": row['qemu_pid'],
+                    "physical_server": {
+                        "id": row['worker_id'],
+                        "name": row['worker_name']
+                    }
                 }
-                Logger.debug(f"Worker registrado: {row['worker_name']}")
+                stop_data['vms'].append(vm_data)
+                Logger.debug(f"VM procesada: Nombre: {vm_data['name']}, ID: {vm_data['id']}")
 
+                # Agregar worker si no existe
+                if str(row['worker_id']) not in stop_data['workers']:
+                    stop_data['workers'][str(row['worker_id'])] = {
+                        "name": row['worker_name'],
+                        "ip": row['worker_ip'],
+                        "ssh_username": row['ssh_username'],
+                        "ssh_password": row['ssh_password'],
+                        "ssh_key_path": row['ssh_key_path']
+                    }
+                    Logger.debug(f"Worker registrado: {row['worker_name']}")
+                    
         # 3. Enviar request a Slice Controller
         Logger.info("Enviando solicitud de detención al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
@@ -3359,6 +3482,41 @@ def stop_slice_endpoint(slice_id: str):
             # Ejecutar transacción
             db.execute_transaction(transactions)
             Logger.success(f"Slice ID-{slice_id} detenida exitosamente")
+
+            Logger.debug("Liberando recursos usados")
+
+            # Obtener recursos de la slice
+            resource_query = """
+                SELECT SUM(f.vcpus) as total_vcpus,
+                    SUM(f.ram) as total_ram,
+                    SUM(f.disk) as total_disk
+                FROM virtual_machine vm
+                JOIN flavor f ON vm.flavor = f.id
+                WHERE vm.slice = %s
+            """
+            resources = db.execute_query(resource_query, (slice_id,))[0]
+
+            # Actualizar recursos en BD
+            update_resources_query = """
+                UPDATE resource
+                SET used_vcpus = used_vcpus - %s,
+                    used_ram = used_ram - %s,
+                    used_disk = used_disk - %s,
+                    used_slices = used_slices - 1
+                WHERE user = %s
+            """
+
+            db.execute_transaction([
+                (update_resources_query, (
+                    resources['total_vcpus'],
+                    resources['total_ram'],
+                    resources['total_disk'],
+                    user_id
+                ))
+            ])
+
+            Logger.debug(f"Recursos liberados del usuario - vCPUs: -{resources['total_vcpus']}, RAM: -{resources['total_ram']}MB, Disk: -{resources['total_disk']}GB")
+            Logger.success(f"Recursos del usuario {user_id} actualizados exitosamente")
 
             return jsonify({
                 "status": "success",
@@ -4225,74 +4383,6 @@ def get_available_vnc_displays():
             "details": str(e)
         }), 500
 
-# @app.route('/vm-vnc/<vm_id>')
-# def vm_vnc(vm_id):
-#     """
-#     Endpoint para acceder a la consola VNC de una VM.
-    
-#     Args:
-#         vm_id (str): ID de la VM
-#         token (query param): Token JWT de autenticación
-        
-#     Returns:
-#         Response: Página HTML con cliente VNC o error
-#             200: Template VNC renderizado
-#             403: Token inválido
-#             404: VM no encontrada
-#             500: Error interno
-#     """
-#     try:
-#         Logger.major_section(f"VNC CONSOLE VM ID-{vm_id}")
-        
-#         # Verificar token
-#         Logger.debug("Validando token de acceso")
-#         Logger.debug(f"Request: {request.args}")
-#         token = request.args.get('token')
-#         Logger.debug(f"Token: {token}")
-#         if not token or not vnc_token_manager.validate_token(token, int(vm_id)):
-#             Logger.warning(f"Token inválido o expirado para VM ID-{vm_id}")
-#             return jsonify({
-#                 "status": "error",
-#                 "message": "Acceso denegado",
-#                 "details": "El token de acceso es inválido o ha expirado"
-#             }), 403
-            
-#         # Obtener información de la VM
-#         Logger.debug("Consultando información de VM")
-#         vm_info = db.execute_query(
-#             """SELECT vm.*, ps.name as worker_name 
-#                FROM virtual_machine vm
-#                JOIN physical_server ps ON vm.physical_server = ps.id
-#                WHERE vm.id = %s""",
-#             (vm_id,)
-#         )
-        
-#         if not vm_info:
-#             Logger.warning(f"VM ID-{vm_id} no encontrada")
-#             return jsonify({
-#                 "status": "error",
-#                 "message": "La máquina virtual solicitada no existe",
-#                 "details": f"No se encontró la VM con ID {vm_id}"
-#             }), 404
-            
-#         vm = vm_info[0]
-#         Logger.info(f"Renderizando cliente VNC para VM ID-{vm_id} con nombre '{vm['name']}'")
-        
-#         return render_template('vnc.html', 
-#             vm_id=vm_id, 
-#             vm_name=vm['name'], 
-#             token=token
-#         )
-        
-#     except Exception as e:
-#         Logger.error(f"Error accediendo a VNC: {str(e)}")
-#         Logger.debug(f"Traceback: {traceback.format_exc()}")
-#         return jsonify({
-#             "status": "error",
-#             "message": f"Error al acceder a la consola VNC de la VM con nombre '{vm['name']}'",
-#             "details": str(e)
-#         }), 500
-
 @app.route('/vm-token/<vm_id>', methods=['POST'])
 def generate_vnc_token(vm_id):
     """
@@ -4622,6 +4712,23 @@ def create_sketch():
                     "details": f"El campo '{field}' es requerido"
                 }), 400
 
+        if len(request_data['name']) > 45:
+            Logger.error("Nombre de sketch excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Nombre de sketch inválido",
+                "details": "El nombre debe tener máximo 45 caracteres"
+            }), 400
+
+        description = request_data.get('description', '')
+        if len(description) > 1000:
+            Logger.error("Descripción de sketch excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Descripción de sketch inválida",
+                "details": "La descripción debe tener máximo 1000 caracteres"
+            }), 400
+        
         # 2. Validar recursos (flavors e images)
         Logger.debug("Validando recursos...")
         topology = request_data['topology_info']
@@ -5006,6 +5113,35 @@ def update_sketch(sketch_id):
         request_data = request.get_json()
         Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
+        # 0. Validar campos requeridos
+        required_fields = ['name', 'topology_info']
+        for field in required_fields:
+            if field not in request_data:
+                Logger.error(f"Campo requerido faltante: {field}")
+                return jsonify({
+                    "status": "error", 
+                    "message": "Faltan campos requeridos",
+                    "details": f"El campo '{field}' es requerido"
+                }), 400
+
+
+        if len(request_data['name']) > 45:
+            Logger.error("Nombre de sketch excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Nombre de sketch inválido",
+                "details": "El nombre debe tener máximo 45 caracteres"
+            }), 400
+
+        description = request_data.get('description', '')
+        if len(description) > 1000:
+            Logger.error("Descripción de sketch excede el límite de caracteres")
+            return jsonify({
+                "status": "error",
+                "message": "Descripción de sketch inválida",
+                "details": "La descripción debe tener máximo 1000 caracteres"
+            }), 400
+
         # 1. Validar user_id
         auth_token = request.headers.get('Authorization')
         if not auth_token:
@@ -5292,6 +5428,7 @@ def list_sketches():
                 "id": sketch['id'],
                 "name": structure['name'],
                 "description": structure.get('description', ''),
+                "vms": structure['topology_info'].get('vms', []),
                 "vm_count": len(structure['topology_info']['vms']),
                 "created_at": sketch['created_at'].isoformat(),
                 "updated_at": sketch['updated_at'].isoformat() if sketch['updated_at'] else None,

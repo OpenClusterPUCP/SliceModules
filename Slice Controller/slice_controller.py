@@ -943,8 +943,10 @@ class SliceManager:
             Logger.debug(f"Imagen VM: {vm_image}")
             Logger.debug(f"Tamaño disco: {flavor_info['disk']}G")
             
+            disk_size_mb = int(flavor_info['disk'] * 1024)
+
             ssh.execute(f"sudo cp {base_path} {vm_image_path}")
-            ssh.execute(f"sudo qemu-img resize {vm_image_path} {flavor_info['disk']}G")
+            ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {disk_size_mb}M")
             ssh.execute(f"sudo chmod 644 {vm_image_path}")
             
             # Verificar imagen creada
@@ -1052,10 +1054,12 @@ class SliceManager:
             Logger.debug(f"Base: {base_image_path}")
             Logger.debug(f"VM: {vm_image_path}")
 
+            disk_size_mb = int(flavor_info['disk'] * 1024)
+
             commands.extend([
                 f"test -f {base_image_path} || exit 1",
                 f"sudo cp {base_image_path} {vm_image_path}",
-                f"sudo qemu-img resize {vm_image_path} {flavor_info['disk']}G",
+                f"sudo qemu-img resize --shrink {vm_image_path} {disk_size_mb}M",
                 f"sudo chmod 644 {vm_image_path}"
             ])
         
@@ -1430,8 +1434,10 @@ class SliceManager:
                     Logger.debug(f"Tamaño: {flavor['disk']} GB")
 
                     # Copiar y redimensionar
+                    disk_size_mb = int(flavor['disk'] * 1024)
+
                     ssh.execute(f"sudo cp {DATA_DIR['images']}/{base_image} {vm_image_path}")
-                    ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {flavor['disk']}G")
+                    ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {disk_size_mb}M")
                     
                     stdout, _ = ssh.execute(f"sudo qemu-img info {vm_image_path}")
                     Logger.debug(f"Información de imagen:\n{stdout}")
@@ -1612,7 +1618,12 @@ class SliceManager:
                 
                 vms_by_worker.setdefault(worker_info['name'], {
                     'info': worker_info,
-                    'vms': []
+                    'vms': [],
+                    'network_config': request_data['network_config'],  # Incluir configuración de red
+                    'interfaces': [  # Incluir interfaces relacionadas a las VMs de este worker
+                        iface for iface in request_data['interfaces']
+                        if iface['vm_id'] == vm['id']
+                    ]
                 })['vms'].append(vm)
 
             # Almacenamiento de resultados
@@ -1624,6 +1635,9 @@ class SliceManager:
                 try:
                     worker_info = worker_data['info']
                     vms = worker_data['vms']
+                    network_config = worker_data['network_config']
+                    interfaces = worker_data['interfaces']
+                    slice_bridge = network_config['slice_bridge_name']
                     
                     Logger.subsection(f"Deteniendo VMs en {worker_name}")
 
@@ -1678,14 +1692,22 @@ class SliceManager:
                                 Logger.debug(f"VM ID-{vm['id']} ya no está corriendo")
 
                         # 2. Limpiar recursos
-                        cleanup_commands = [
-                            f"sudo ovs-vsctl --if-exists del-port br-int p-br-s{slice_id}",
-                            f"sudo ovs-vsctl --if-exists del-port br-s{slice_id} p-s{slice_id}-int",
-                            f"sudo ovs-vsctl --if-exists del-br br-s{slice_id}",
-                            f"sudo rm -f /home/ubuntu/SliceManager/images/vm-*-slice-{slice_id}*.qcow2",
-                            f"sudo ip link show | grep 'tap.*-S{slice_id}' | cut -d':' -f2 | xargs -I{{}} sudo ip link del {{}} 2>/dev/null || true",
-                            f"sudo ovs-vsctl list-ports br-int | grep 'tapx' | xargs -I{{}} sudo ovs-vsctl del-port br-int {{}} && sudo ip link show | grep 'tapx' | cut -d':' -f2 | xargs -I{{}} sudo ip link del {{}} 2>/dev/null || true"
-                        ]
+                        cleanup_commands = []
+            
+                        # Eliminar TAP interfaces
+                        for iface in interfaces:
+                            if iface['external_access']:
+                                cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port br-int {iface['tap_name']}")
+                            else:
+                                cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {iface['tap_name']}")
+                            cleanup_commands.append(f"sudo ip link del {iface['tap_name']} 2>/dev/null || true")
+
+                        # Eliminar bridges y patch ports
+                        cleanup_commands.extend([
+                            f"sudo ovs-vsctl --if-exists del-port br-int {network_config['patch_ports']['int_side']}",
+                            f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {network_config['patch_ports']['slice_side']}",
+                            f"sudo ovs-vsctl --if-exists del-br {slice_bridge}"
+                        ])
                     
                         Logger.info(f"Ejecutando limpieza en {worker_name}")
                         try:
