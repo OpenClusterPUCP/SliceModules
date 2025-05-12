@@ -1857,7 +1857,7 @@ def deploy_slice():
                 "details": "El nombre debe tener máximo 45 caracteres"
             }), 400
 
-        if len(slice_info['description']) > 1000:
+        if slice_info['description'] != None and len(slice_info['description']) > 1000:
             Logger.error("Descripción de slice excede el límite de caracteres")
             return jsonify({
                 "status": "error",
@@ -4721,7 +4721,7 @@ def create_sketch():
             }), 400
 
         description = request_data.get('description', '')
-        if len(description) > 1000:
+        if description != None and len(description) > 1000:
             Logger.error("Descripción de sketch excede el límite de caracteres")
             return jsonify({
                 "status": "error",
@@ -5134,7 +5134,7 @@ def update_sketch(sketch_id):
             }), 400
 
         description = request_data.get('description', '')
-        if len(description) > 1000:
+        if description != None and len(description) > 1000:
             Logger.error("Descripción de sketch excede el límite de caracteres")
             return jsonify({
                 "status": "error",
