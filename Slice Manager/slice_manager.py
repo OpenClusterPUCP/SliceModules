@@ -137,6 +137,66 @@ def get_service_instance(service_name: str) -> dict:
         return None
 
 
+def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, priority="MEDIUM"):
+    """
+    Envía una solicitud al Queue Manager para encolar una operación.
+
+    Args:
+        operation_type (str): Tipo de operación (DEPLOY_SLICE, STOP_SLICE, etc.)
+        cluster_type (str): Tipo de cluster (LINUX, OPENSTACK)
+        zone_id (int): ID de la zona de disponibilidad
+        user_id (int): ID del usuario
+        payload (dict): Datos de la operación
+        priority (str): Prioridad (HIGH, MEDIUM, LOW)
+
+    Returns:
+        dict: Respuesta del Queue Manager con el ID de operación
+
+    Raises:
+        Exception: Si hay error comunicándose con el Queue Manager
+    """
+    try:
+        Logger.debug(f"Encolando operación: {operation_type}")
+
+        # Obtener instancia del Queue Manager
+        queue_manager = get_service_instance('queue-manager-module')
+        if not queue_manager:
+            raise Exception("Servicio queue-manager-module no disponible")
+
+        # Preparar request
+        request_data = {
+            "operationType": operation_type,
+            "clusterType": cluster_type,
+            "zoneId": zone_id,
+            "userId": user_id,
+            "payload": payload,
+            "priority": priority
+        }
+
+        # Enviar solicitud
+        response = requests.post(
+            f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/operations",
+            json=request_data,
+            timeout=30
+        )
+
+        # Verificar respuesta
+        if response.status_code != 200:
+            raise Exception(f"Error al encolar operación: {response.text}")
+
+        response_data = response.json()
+        if not response_data.get("success"):
+            raise Exception(f"Error al encolar operación: {response_data.get('message')}")
+
+        Logger.success(f"Operación encolada exitosamente. ID: {response_data.get('operationId')}")
+        return response_data
+
+    except Exception as e:
+        Logger.error(f"Error al encolar operación: {str(e)}")
+        raise
+
+
+
 # ===================== CONFIGURACIÓN BD =====================
 DB_CONFIG = {
     "host": "localhost",
@@ -1810,7 +1870,9 @@ def deploy_slice():
     {
         "slice_info": {
             "name": str, 
-            "description": str
+            "description": str,
+            "user_id": int,
+            "sketch_id": int
         },
         "topology_info": {
             "vms": [...],
@@ -1820,8 +1882,10 @@ def deploy_slice():
     }
 
     Returns:
-        200: Slice desplegado exitosamente
-        400: Error en request 
+        202: Solicitud de despliegue encolada exitosamente
+        400: Error en request
+        403: Recursos insuficientes
+        404: Sketch no encontrado
         500: Error interno
     """
     try:
@@ -1871,11 +1935,11 @@ def deploy_slice():
         # 2. Obtener y validar sketch
         Logger.debug(f"Consultando sketch ID-{sketch_id}")
         sketch_query = """
-            SELECT s.*, u.username 
-            FROM sketch s
-            JOIN user u ON s.user = u.id
-            WHERE s.id = %s
-        """
+                       SELECT s.*, u.username
+                       FROM sketch s
+                                JOIN user u ON s.user = u.id
+                       WHERE s.id = %s \
+                       """
         sketch_data = db.execute_query(sketch_query, (sketch_id,))
 
         if not sketch_data:
@@ -1888,7 +1952,7 @@ def deploy_slice():
 
         sketch = sketch_data[0]
         structure = json.loads(sketch['structure'])
-        
+
         # 3. Validar acceso a recursos y límites
         Logger.debug("Validando acceso a recursos...")
         topology = structure['topology_info']
@@ -1904,7 +1968,7 @@ def deploy_slice():
             FROM flavor 
             WHERE id IN (%s) 
             AND state = 'active'
-            AND (user IS NULL OR user = %s)""" % 
+            AND (user IS NULL OR user = %s)""" %
             (','.join(flavor_ids) if flavor_ids else 'NULL', user_id)
         )
         valid_flavor_ids = {str(f['id']) for f in valid_flavors}
@@ -1925,7 +1989,7 @@ def deploy_slice():
             """SELECT id FROM image 
             WHERE id IN (%s) 
             AND state = 'active'
-            AND (user IS NULL OR user = %s)""" % 
+            AND (user IS NULL OR user = %s)""" %
             (','.join(image_ids) if image_ids else 'NULL', user_id)
         )
         valid_image_ids = {str(i['id']) for i in valid_images}
@@ -1942,11 +2006,17 @@ def deploy_slice():
         # 3.2 Verificar límites de recursos del usuario
         Logger.debug("Verificando límites de recursos del usuario")
         resource_query = """
-            SELECT vcpus, ram, disk, slices,
-                used_vcpus, used_ram, used_disk, used_slices
-            FROM resource 
-            WHERE user = %s
-        """
+                         SELECT vcpus, \
+                                ram, \
+                                disk, \
+                                slices,
+                                used_vcpus, \
+                                used_ram, \
+                                used_disk, \
+                                used_slices
+                         FROM resource
+                         WHERE user = %s \
+                         """
         user_resources = db.execute_query(resource_query, (user_id,))
 
         if not user_resources:
@@ -1970,20 +2040,21 @@ def deploy_slice():
             required_ram += flavor['ram']
             required_disk += flavor['disk']
 
-        
         # Verificar disponibilidad
         available_vcpus = resources['vcpus'] - resources['used_vcpus']
         available_ram = resources['ram'] - resources['used_ram']
-        available_disk = round(float(resources['disk']) - float(resources['used_disk']),1)
+        available_disk = round(float(resources['disk']) - float(resources['used_disk']), 1)
         available_slices = resources['slices'] - resources['used_slices']
 
         errors = []
         if required_vcpus > available_vcpus:
-            errors.append(f"vCPUs de usuario insuficientes (requerido: {required_vcpus}, disponible: {available_vcpus})")
+            errors.append(
+                f"vCPUs de usuario insuficientes (requerido: {required_vcpus}, disponible: {available_vcpus})")
         if required_ram > available_ram:
             errors.append(f"RAM de usuario insuficiente (requerido: {required_ram}MB, disponible: {available_ram}MB)")
         if required_disk > available_disk:
-            errors.append(f"Almacenamiento de usuario insuficiente (requerido: {required_disk}GB, disponible: {available_disk}GB)")
+            errors.append(
+                f"Almacenamiento de usuario insuficiente (requerido: {required_disk}GB, disponible: {available_disk}GB)")
         if available_slices < 1:
             errors.append(f"Límite de slices en ejecución de usuario alcanzado (máximo: {resources['slices']})")
 
@@ -1996,7 +2067,6 @@ def deploy_slice():
             }), 403
 
         Logger.success("Validación de recursos completada")
-
 
         # 4. Construir configuración para despliegue
         Logger.debug("Preparando configuración para despliegue")
@@ -2022,145 +2092,49 @@ def deploy_slice():
                 "details": str(e)
             }), 500
 
-        # 6. Enviar a Slice Controller para despliegue
-        Logger.subsection("Enviando configuración a Slice Controller")
+        # 6. Enviar a Queue Manager para encolamiento
+        Logger.subsection("Enviando solicitud al Queue Manager")
         try:
-            slice_controller = get_service_instance('slice-controller')
-            if not slice_controller:
-                raise Exception("Servicio slice-controller no disponible")
+            # Determinar el tipo de cluster y zona
+            cluster_type = "LINUX"  # Por ahora solo tenemos cluster Linux
+            zone_id = 1  # Por ahora solo tenemos la zona 1
 
-            server_response = requests.post(
-                f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/deploy-slice",
-                json=json.loads(json.dumps(processed_config, default=json_handler)),
-                timeout=300
+            # Encolar operación
+            queue_response = enqueue_operation(
+                operation_type="DEPLOY_SLICE",
+                cluster_type=cluster_type,
+                zone_id=zone_id,
+                user_id=user_id,
+                payload=json.loads(json.dumps(processed_config, default=json_handler)),
+                priority="HIGH"  # Consideramos deploy como alta prioridad
             )
-            Logger.debug(f"Respuesta Slice Controller: {server_response.status_code}")
-            Logger.debug(f"Contenido: {json.dumps(server_response.json(), indent=2)}")
-            
-        except requests.exceptions.Timeout:
-            Logger.error("Timeout en comunicación con Slice Controller")
-            return jsonify({
-                "status": "error",
-                "message": "El servidor de despliegue no respondió a tiempo",
-                "details": "La operación excedió el tiempo máximo de espera (300s)"
-            }), 503
-        except requests.RequestException as e:
-            Logger.error(f"Error de comunicación: {str(e)}")
-            return jsonify({
-                "status": "error",
-                "message": "Error comunicándose con el servidor de despliegue",
-                "details": str(e)
-            }), 500
 
-        if server_response.status_code != 200:
-            Logger.error(f"Error en Slice Controller: {server_response.text}")
-            return jsonify({
-                "status": "error",
-                "message": "El servidor de despliegue reportó un error",
-                "details": server_response.json()['details']
-            }), server_response.status_code
-
-        # 7. Procesar respuesta y actualizar configuración
-        Logger.subsection("Procesando respuesta del servidor")
-        try:
-            server_data = server_response.json()
-            
-            # Validar estructura de respuesta
-            if not isinstance(server_data, dict):
-                raise ValueError(f"Formato de respuesta inválido: {server_data}")
-            if 'content' not in server_data:
-                raise ValueError(f"Respuesta sin campo 'content': {server_data}")
-            if 'topology_info' not in server_data['content']:
-                raise ValueError(f"Respuesta sin topology_info: {server_data['content']}")
-
-            # Actualizar configuración
-            deployed_config = processed_config
-            deployed_config['slice_info']['status'] = 'running'
-            
-            # Actualizar estado de VMs
-            server_content = server_data['content']
-            vm_updates = []
-            for vm in deployed_config['topology_info']['vms']:
-                server_vm = next(
-                    (v for v in server_content['topology_info']['vms'] 
-                    if v['id'] == vm['id']), 
-                    None
-                )
-                if server_vm:
-                    vm['qemu_pid'] = server_vm.get('qemu_pid')
-                    vm['status'] = 'running' if vm['qemu_pid'] else 'error'
-                    vm_updates.append(f"VM ID-{vm['id']} con nombre '{vm['name']}': {vm['status']}")
-                else:
-                    Logger.warning(f"No se encontró info de VM ID-{vm['id']}")
+            operation_id = queue_response.get("operationId")
+            Logger.success(f"Solicitud de despliegue encolada. ID de operación: {operation_id}")
 
         except Exception as e:
-            Logger.error(f"Error procesando respuesta: {str(e)}")
+            Logger.error(f"Error encolando solicitud: {str(e)}")
             return jsonify({
                 "status": "error",
-                "message": "Error procesando la respuesta del servidor",
+                "message": "Error al encolar la solicitud de despliegue",
                 "details": str(e)
             }), 500
 
-        # 8. Guardar configuración y crear propiedad
-        Logger.subsection("Guardando configuración en BD")
-        try:
-            # Guardar slice
-            if not processor.save_deployed_slice(deployed_config):
-                raise Exception("Error guardando la slice")
-
-            slice_id = deployed_config['slice_info']['id']
-
-            # Crear entrada en tabla property
-            property_query = """
-                INSERT INTO property (user, slice) 
-                VALUES (%s, %s)
-            """
-            db.execute_transaction([
-                (property_query, (user_id, slice_id))
-            ])
-            Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
-
-            # Actualizar recursos usados
-            Logger.debug("Actualizando recursos usados del usuario")
-            update_resources_query = """
-                UPDATE resource
-                SET used_vcpus = used_vcpus + %s,
-                    used_ram = used_ram + %s,
-                    used_disk = used_disk + %s,
-                    used_slices = used_slices + 1
-                WHERE user = %s
-            """
-
-            db.execute_transaction([
-                (update_resources_query, (required_vcpus, required_ram, required_disk, user_id))
-            ])
-
-            Logger.debug(f"Recursos actualizados - vCPUs: +{required_vcpus}, RAM: +{required_ram}MB, Disk: +{required_disk}GB")
-            Logger.success(f"Recursos del usuario {user_id} actualizados exitosamente")
-
-
-        except Exception as e:
-            Logger.error(f"Error guardando configuración: {str(e)}")
-            return jsonify({
-                "status": "error",
-                "message": "Error guardando la configuración de la slice",
-                "details": str(e)
-            }), 500
-
-        # 9. Retornar respuesta exitosa
-        Logger.success("Despliegue completado exitosamente")
+        # 7. Retornar información al usuario con ID de operación
         return jsonify({
             "status": "success",
-            "message": f"Slice '{deployed_config['slice_info']['name']}' desplegada exitosamente",
-            "content": deployed_config,
+            "message": f"Solicitud de despliegue '{processed_config['slice_info']['name']}' encolada exitosamente",
+            "content": {
+                "operation_id": operation_id,
+                "slice_info": processed_config['slice_info'],
+                "status": "pending",
+                "user_id": user_id
+            },
             "details": {
-                "slice_id": slice_id,
-                "user_id": user_id,
-                "sketch_id": sketch_id,
-                "vm_status": vm_updates
+                "message": "La solicitud ha sido encolada y será procesada próximamente. Puede consultar el estado usando el ID de operación."
             }
-        }), 200
-    
+        }), 202  # Código 202 Accepted para indicar que se ha aceptado pero no procesado completamente
+
     except Exception as e:
         Logger.error(f"Error general en deploy_slice: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
@@ -2169,6 +2143,601 @@ def deploy_slice():
             "message": "Error interno durante el despliegue de la slice",
             "details": str(e)
         }), 500
+
+
+@app.route('/check-operation/<operation_id>', methods=['GET'])
+def check_operation_status(operation_id):
+    """
+    Endpoint para consultar el estado de una operación.
+
+    Args:
+        operation_id: ID de la operación a consultar
+
+    Returns:
+        200: Estado de la operación
+        400: ID inválido
+        404: Operación no encontrada
+        500: Error interno
+    """
+    try:
+        Logger.major_section(f"API: CHECK OPERATION ID-{operation_id}")
+
+        # Validar ID
+        try:
+            operation_id = int(operation_id)
+        except ValueError:
+            Logger.error(f"ID de operación inválido: {operation_id}")
+            return jsonify({
+                "status": "error",
+                "message": "ID de operación inválido",
+                "details": "El ID debe ser un número entero"
+            }), 400
+
+        # Obtener instancia del Queue Manager
+        queue_manager = get_service_instance('queue-manager-module')
+        if not queue_manager:
+            raise Exception("Servicio queue-manager-module no disponible")
+
+        # Consultar estado
+        response = requests.get(
+            f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/operations/{operation_id}",
+            timeout=30
+        )
+
+        # Procesar respuesta
+        if response.status_code != 200:
+            Logger.error(f"Error consultando estado: {response.text}")
+            return jsonify({
+                "status": "error",
+                "message": "Error consultando estado de operación",
+                "details": response.text
+            }), response.status_code
+
+        # Extraer estado
+        response_data = response.json()
+        operation_status = response_data.get("status")
+
+        Logger.info(f"Estado de operación ID-{operation_id}: {operation_status}")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Estado de operación consultado exitosamente",
+            "content": {
+                "operation_id": operation_id,
+                "operation_status": operation_status
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error consultando estado de operación: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error consultando estado de operación",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/operation-callback', methods=['POST'])
+def operation_callback():
+    """
+    Endpoint para recibir notificaciones del Queue Manager sobre el resultado de operaciones.
+    Este endpoint es llamado por el Queue Manager cuando una operación termina (éxito o fallo).
+
+    Request body:
+    {
+        "operationId": int,
+        "operationType": str,
+        "userId": int,
+        "status": str, # "SUCCESS" o "FAILED"
+        "result": {...}, # en caso de éxito
+        "error": str  # en caso de fallo
+    }
+
+    Returns:
+        200: Callback procesado correctamente
+        400: Request incompleto o inválido
+        500: Error interno
+    """
+    try:
+        Logger.major_section("API: OPERATION CALLBACK")
+
+        # Validar request
+        request_data = request.get_json()
+        if not request_data:
+            Logger.error("No se recibieron datos JSON")
+            return jsonify({
+                "status": "error",
+                "message": "No se recibieron datos JSON",
+                "details": "El request debe incluir información del resultado de la operación"
+            }), 400
+
+        Logger.debug(f"Datos de callback: {json.dumps(request_data, indent=2)}")
+
+        # Extraer información
+        operation_id = request_data.get('operationId')
+        operation_type = request_data.get('operationType')
+        user_id = request_data.get('userId')
+        status = request_data.get('status')
+
+        if not all([operation_id, operation_type, user_id, status]):
+            Logger.error("Faltan campos requeridos en el callback")
+            return jsonify({
+                "status": "error",
+                "message": "Datos de callback incompletos",
+                "details": "Faltan campos requeridos: operationId, operationType, userId, status"
+            }), 400
+
+        # Procesar según el tipo de operación y estado
+        if operation_type == "DEPLOY_SLICE" and status == "SUCCESS":
+            # Procesar despliegue exitoso
+            result = request_data.get('result', {})
+            if not result:
+                Logger.error("Faltan datos de resultado para despliegue exitoso")
+                return jsonify({
+                    "status": "error",
+                    "message": "Datos de resultado incompletos",
+                    "details": "No se proporcionaron datos del slice desplegado"
+                }), 400
+
+            # Procesar y guardar datos del slice desplegado
+            return process_deploy_slice_success(result, user_id)
+
+        elif operation_type == "DEPLOY_SLICE" and status == "FAILED":
+            # Procesar fallo de despliegue
+            error_message = request_data.get('error', "Error desconocido")
+            return process_deploy_slice_failure(operation_id, error_message, user_id)
+
+        # Para otros tipos de operación, implementar según sea necesario
+        # Por ahora solo manejamos DEPLOY_SLICE
+
+        return jsonify({
+            "status": "success",
+            "message": "Callback procesado",
+            "details": "Tipo de operación no implementado específicamente"
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error procesando callback: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error procesando callback",
+            "details": str(e)
+        }), 500
+
+
+def process_deploy_slice_success(deployed_data, user_id):
+    """
+    Procesa un despliegue exitoso de slice y guarda los datos en la BD.
+
+    Args:
+        deployed_data (dict): Datos del slice desplegado
+        user_id (int): ID del usuario
+
+    Returns:
+        Response: Mensaje de éxito/error
+    """
+    try:
+        Logger.section("PROCESANDO DESPLIEGUE EXITOSO")
+        Logger.debug(f"Datos recibidos: {json.dumps(deployed_data, indent=2)}")
+
+        # Verificar datos
+        if not deployed_data.get('content'):
+            raise ValueError("Faltan datos en el resultado ('content')")
+
+        # Extraer configuración
+        deployed_config = deployed_data.get('content')
+
+        # 1. Guardar slice
+        processor = SliceProcessor()
+        if not processor.save_deployed_slice(deployed_config):
+            raise Exception("Error guardando la slice")
+
+        slice_id = deployed_config['slice_info']['id']
+
+        # 2. Crear entrada en tabla property
+        property_query = """
+                         INSERT INTO property (user, slice)
+                         VALUES (%s, %s) \
+                         """
+        db.execute_transaction([
+            (property_query, (user_id, slice_id))
+        ])
+        Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
+
+        # 3. Actualizar recursos usados
+        Logger.debug("Actualizando recursos usados del usuario")
+
+        # Calcular recursos utilizados
+        vm_list = deployed_config['topology_info']['vms']
+        flavors = deployed_config['resources_info']['flavors']
+
+        required_vcpus = 0
+        required_ram = 0
+        required_disk = 0
+
+        for vm in vm_list:
+            flavor_id = str(vm['flavor_id'])
+            flavor = flavors[flavor_id]
+            required_vcpus += flavor['vcpus']
+            required_ram += flavor['ram']
+            required_disk += float(flavor['disk'])
+
+        update_resources_query = """
+                                 UPDATE resource
+                                 SET used_vcpus  = used_vcpus + %s,
+                                     used_ram    = used_ram + %s,
+                                     used_disk   = used_disk + %s,
+                                     used_slices = used_slices + 1
+                                 WHERE user = %s \
+                                 """
+
+        db.execute_transaction([
+            (update_resources_query, (required_vcpus, required_ram, required_disk, user_id))
+        ])
+
+        Logger.debug(
+            f"Recursos actualizados - vCPUs: +{required_vcpus}, RAM: +{required_ram}MB, Disk: +{required_disk}GB")
+        Logger.success(f"Recursos del usuario {user_id} actualizados exitosamente")
+
+        # 4. Respuesta final
+        Logger.success(f"Despliegue de slice {slice_id} completado y guardado exitosamente")
+        return jsonify({
+            "status": "success",
+            "message": f"Slice desplegado exitosamente",
+            "content": {
+                "slice_id": slice_id,
+                "user_id": user_id
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error procesando despliegue exitoso: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error procesando despliegue exitoso",
+            "details": str(e)
+        }), 500
+
+
+def process_deploy_slice_failure(operation_id, error_message, user_id):
+    """
+    Procesa un fallo en el despliegue de slice.
+
+    Args:
+        operation_id (int): ID de la operación
+        error_message (str): Mensaje de error
+        user_id (int): ID del usuario
+
+    Returns:
+        Response: Mensaje de error
+    """
+    try:
+        Logger.section("PROCESANDO FALLO DE DESPLIEGUE")
+        Logger.error(f"Fallo en despliegue, operación ID-{operation_id}: {error_message}")
+
+        # Aquí podríamos notificar al usuario, registrar el error en logs, etc.
+        # Por ahora solo retornamos un mensaje informativo
+
+        return jsonify({
+            "status": "success",
+            "message": "Notificación de fallo procesada",
+            "content": {
+                "operation_id": operation_id,
+                "error": error_message,
+                "user_id": user_id
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error procesando fallo de despliegue: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error procesando fallo de despliegue",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/poll-operation/<operation_id>', methods=['GET'])
+def poll_operation(operation_id):
+    """
+    Endpoint para que el frontend consulte periódicamente el estado de una operación.
+
+    Args:
+        operation_id: ID de la operación a consultar
+
+    Returns:
+        200: Estado de la operación
+        400: ID inválido
+        404: Operación no encontrada
+        500: Error interno
+    """
+    try:
+        Logger.debug(f"Consultando estado de operación ID-{operation_id}")
+
+        # Validar ID
+        try:
+            operation_id = int(operation_id)
+        except ValueError:
+            return jsonify({
+                "status": "error",
+                "message": "ID de operación inválido",
+                "details": "El ID debe ser un número entero"
+            }), 400
+
+        # Obtener instancia del Queue Manager
+        queue_manager = get_service_instance('queue-manager-module')
+        if not queue_manager:
+            raise Exception("Servicio queue-manager-module no disponible")
+
+        # Consultar estado
+        response = requests.get(
+            f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/operations/{operation_id}",
+            timeout=30
+        )
+
+        # Procesar respuesta
+        if response.status_code != 200:
+            Logger.error(f"Error consultando estado: {response.text}")
+            return jsonify({
+                "status": "error",
+                "message": "Error consultando estado de operación",
+                "details": response.text
+            }), response.status_code
+
+        # Extraer estado y añadir mensajes descriptivos
+        response_data = response.json()
+        operation_status = response_data.get("status")
+
+        status_messages = {
+            "PENDING": "La operación está en cola y será procesada próximamente",
+            "IN_PROGRESS": "La operación está siendo procesada actualmente",
+            "COMPLETED": "La operación ha sido completada exitosamente",
+            "FAILED": "La operación ha fallado",
+            "TIMEOUT": "La operación excedió el tiempo máximo de espera",
+            "CANCELLED": "La operación fue cancelada"
+        }
+
+        status_message = status_messages.get(operation_status, "Estado desconocido")
+
+        # Verificar si es un despliegue exitoso y la slice ya está registrada
+        slice_id = None
+        if operation_status == "COMPLETED" and "DEPLOY_SLICE" in response_data.get("operationType", ""):
+            # Intentar obtener el ID de la slice desde la BD
+            # Esta es una consulta simplificada, ajustar según la estructura real
+            try:
+                # Buscar en slice y property para verificar que se haya guardado correctamente
+                result = db.execute_query(
+                    """SELECT s.id
+                       FROM slice s
+                                JOIN property p ON s.id = p.slice
+                       WHERE p.user = %s
+                       ORDER BY s.created_at DESC LIMIT 1""",
+                    (response_data.get("userId"),)
+                )
+                if result:
+                    slice_id = result[0]['id']
+            except Exception as e:
+                Logger.warning(f"Error buscando slice recién creada: {str(e)}")
+
+        return jsonify({
+            "status": "success",
+            "message": "Estado de operación consultado exitosamente",
+            "content": {
+                "operation_id": operation_id,
+                "operation_status": operation_status,
+                "status_message": status_message,
+                "slice_id": slice_id
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error consultando estado de operación: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error consultando estado de operación",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/User/api/operations/<operation_id>/status', methods=['GET'])
+def get_operation_status(operation_id):
+    """
+    Obtiene el estado actual de una operación.
+
+    Args:
+        operation_id: ID de la operación a consultar
+
+    Returns:
+        200: Estado de la operación
+        400: ID inválido
+        404: Operación no encontrada
+        500: Error interno
+    """
+    try:
+        Logger.section(f"API: GET OPERATION STATUS ID-{operation_id}")
+
+        # Validar ID
+        try:
+            operation_id = int(operation_id)
+        except ValueError:
+            Logger.error(f"ID de operación inválido: {operation_id}")
+            return jsonify({
+                "status": "error",
+                "message": "ID de operación inválido",
+                "details": "El ID debe ser un número entero"
+            }), 400
+
+        # Obtener instancia del Queue Manager
+        queue_manager = get_service_instance('queue-manager-module')
+        if not queue_manager:
+            raise Exception("Servicio queue-manager-module no disponible")
+
+        # Consultar estado
+        response = requests.get(
+            f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/operations/{operation_id}",
+            timeout=30
+        )
+
+        # Procesar respuesta
+        if response.status_code != 200:
+            Logger.error(f"Error consultando estado: {response.text}")
+            return jsonify({
+                "status": "error",
+                "message": "Error consultando estado de operación",
+                "details": response.text
+            }), response.status_code
+
+        # Extraer estado y añadir mensajes descriptivos
+        response_data = response.json()
+        operation_status = response_data.get("status")
+
+        status_messages = {
+            "PENDING": "La operación está en cola y será procesada próximamente",
+            "IN_PROGRESS": "La operación está siendo procesada actualmente",
+            "COMPLETED": "La operación ha sido completada exitosamente",
+            "FAILED": "La operación ha fallado",
+            "TIMEOUT": "La operación excedió el tiempo máximo de espera",
+            "CANCELLED": "La operación fue cancelada"
+        }
+
+        status_message = status_messages.get(operation_status, "Estado desconocido")
+
+        # Verificar si es un despliegue exitoso y la slice ya está registrada
+        slice_id = None
+        if operation_status == "COMPLETED" and "DEPLOY_SLICE" in response_data.get("operationType", ""):
+            # Intentar obtener el ID de la slice desde la BD
+            try:
+                # Buscar en slice y property para verificar que se haya guardado correctamente
+                result = db.execute_query(
+                    """SELECT s.id
+                       FROM slice s
+                                JOIN property p ON s.id = p.slice
+                       WHERE p.user = %s
+                       ORDER BY s.created_at DESC LIMIT 1""",
+                    (response_data.get("userId"),)
+                )
+                if result:
+                    slice_id = result[0]['id']
+            except Exception as e:
+                Logger.warning(f"Error buscando slice recién creada: {str(e)}")
+
+        return jsonify({
+            "status": "success",
+            "message": "Estado de operación consultado exitosamente",
+            "content": {
+                "operation_id": operation_id,
+                "operation_status": operation_status,
+                "status_message": status_message,
+                "slice_id": slice_id
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error consultando estado de operación: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error consultando estado de operación",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/User/api/user/pending-operations', methods=['GET'])
+def get_user_pending_operations():
+    """
+    Obtiene las operaciones pendientes del usuario actual.
+
+    Returns:
+        200: Lista de operaciones pendientes
+        401: No autorizado
+        500: Error interno
+    """
+    try:
+        Logger.section("API: GET USER PENDING OPERATIONS")
+
+        # Validar user_id
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
+            return jsonify({
+                "status": "error",
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+
+        # Obtener user_id desde username
+        user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error",
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
+        # Obtener operaciones pendientes del Queue Manager
+        queue_manager = get_service_instance('queue-manager-module')
+        if not queue_manager:
+            raise Exception("Servicio queue-manager-module no disponible")
+
+        # Consultar operaciones pendientes
+        statuses = ["PENDING", "IN_PROGRESS"]
+        response = requests.get(
+            f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/user/{user_id}/operations?statuses={','.join(statuses)}",
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            Logger.error(f"Error consultando operaciones pendientes: {response.text}")
+            return jsonify({
+                "status": "error",
+                "message": "Error consultando operaciones pendientes",
+                "details": response.text
+            }), response.status_code
+
+        # Procesar respuesta
+        response_data = response.json()
+
+        # Obtener información adicional para cada operación
+        operations = response_data.get("operations", [])
+        for op in operations:
+            # Para operaciones de despliegue, obtener nombre de la slice
+            if op.get("operationType") == "DEPLOY_SLICE" and op.get("payload"):
+                slice_info = op.get("payload", {}).get("slice_info", {})
+                op["sliceName"] = slice_info.get("name", "Slice Sin Nombre")
+
+        return jsonify({
+            "status": "success",
+            "message": "Operaciones pendientes consultadas exitosamente",
+            "content": {
+                "operations": operations
+            }
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error consultando operaciones pendientes: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error consultando operaciones pendientes",
+            "details": str(e)
+        }), 500
+
 
 @app.route('/pause-vm/<vm_id>', methods=['POST'])
 def pause_vm_endpoint(vm_id: str):
