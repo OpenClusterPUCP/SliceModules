@@ -1,5 +1,5 @@
 # ==============================================================================
-# | ARCHIVO: slice_manager.py  
+# | ARCHIVO: slice_manager.py
 # ==============================================================================
 # | DESCRIPCIÓN:
 # | API REST que implementa la interfaz de gestión y administración de slices, actuando como
@@ -14,9 +14,9 @@
 # |    - Pool de conexiones y transacciones
 # |    - Logger personalizado para debugging
 # |
-# | 2. GESTORES/MÓDULOS PRINCIPALES  
+# | 2. GESTORES/MÓDULOS PRINCIPALES
 # |    - DatabaseManager: Pool de conexiones MySQL
-# |    - VNCTokenManager: Tokens JWT para acceso VNC 
+# |    - VNCTokenManager: Tokens JWT para acceso VNC
 # |    - RequestValidator: Validación de requests
 # |    - WorkerAssigner: Asignación de workers y displays
 # |    - SliceProcessor: Gestión y procesamiento de slices
@@ -76,7 +76,7 @@ from decimal import Decimal
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
-from typing import Dict, List, Union, Tuple, Optional 
+from typing import Dict, List, Union, Tuple, Optional
 
 
 # ===================== CONFIGURACIÓN DE FLASK =====================
@@ -92,7 +92,7 @@ eureka_client.init(
     eureka_server=eureka_server,
     app_name="slice-manager",
     instance_port=5001,
-    instance_host="localhost",    
+    instance_host="localhost",
     renewal_interval_in_secs=30,
     duration_in_secs=90,
 )
@@ -100,38 +100,38 @@ eureka_client.init(
 def get_service_instance(service_name: str) -> dict:
     """
     Obtiene información de la instancia de un servicio registrado en Eureka.
-    
+
     Args:
         service_name (str): Nombre del servicio registrado en Eureka
-        
+
     Returns:
         dict: Información de la instancia con host y puerto, o None si no se encuentra
-        
+
     Example:
         instance = get_service_instance('slice-manager')
         url = f"http://{instance['ipAddr']}:{instance['port']}/endpoint"
     """
     try:
         Logger.debug(f"Buscando instancia de servicio: {service_name}")
-        
+
         # Obtener instancia a través del cliente Eureka
         instance = eureka_client.get_client().applications.get_application(service_name)
         if not instance or not instance.up_instances:
             Logger.error(f"Servicio {service_name} no encontrado en Eureka")
             return None
-            
+
         # Obtener primera instancia disponible
         instance = instance.up_instances[0]
-        
+
         service_info = {
             'ipAddr': instance.ipAddr,
             'port': instance.port.port,
             'hostName': instance.hostName
         }
-        
+
         Logger.debug(f"Instancia encontrada: {json.dumps(service_info, indent=2)}")
         return service_info
-        
+
     except Exception as e:
         Logger.error(f"Error obteniendo instancia de {service_name}: {str(e)}")
         return None
@@ -219,13 +219,13 @@ POOL_CONFIG = {
 def datetime_handler(obj):
     """
     Manejador personalizado para serialización JSON de objetos datetime.
-    
+
     Args:
         obj: Objeto a serializar
-        
+
     Returns:
         str: Representación ISO del datetime
-        
+
     Raises:
         TypeError: Si el objeto no es serializable
     """
@@ -338,21 +338,21 @@ class Logger:
 class VNCTokenManager:
     """
     Administrador de tokens JWT para acceso VNC.
-    
+
     Esta clase maneja la generación y validación de tokens JWT (JSON Web Tokens)
     que se utilizan para autenticar conexiones VNC a las máquinas virtuales.
-    
+
     Atributos:
         secret_key (str): Clave secreta para firmar los tokens
         token_expiry (timedelta): Tiempo de expiración del token
     """
-    
+
     def __init__(self):
         """
         Inicializa el administrador de tokens VNC.
-        
+
         Note:
-            En producción se debe usar una clave secreta más segura y 
+            En producción se debe usar una clave secreta más segura y
             almacenarla de forma segura (ej: variables de entorno)
         """
         self.secret_key = "redes-cloud"  # TODO: Mover a config
@@ -363,35 +363,35 @@ class VNCTokenManager:
     def generate_token(self, vm_id: int) -> str:
         """
         Genera un token JWT para acceso VNC a una VM específica.
-        
+
         Args:
             vm_id (int): ID de la máquina virtual
-            
+
         Returns:
             str: Token JWT codificado
-            
+
         Raises:
             Exception: Si hay error generando el token
         """
         try:
             Logger.debug(f"Generando token VNC para VM ID-{vm_id}")
             current_time = datetime.datetime.utcnow()
-            
+
             payload = {
                 'vm_id': vm_id,
                 'exp': current_time + self.token_expiry,
                 'iat': current_time
             }
             Logger.debug(f"Payload del token: {payload}")
-            
+
             # Codificar y decodificar el token a string
             token = jwt.encode(payload, self.secret_key, algorithm='HS256')
             if isinstance(token, bytes):
                 token = token.decode('utf-8')
-                
+
             Logger.success(f"Token generado exitosamente para VM ID-{vm_id}")
             return token
-            
+
         except Exception as e:
             Logger.error(f"Error generando token VNC para VM ID-{vm_id}: {str(e)}")
             raise Exception(f"Error generando token VNC: {str(e)}")
@@ -399,38 +399,38 @@ class VNCTokenManager:
     def validate_token(self, token: str, vm_id: int) -> bool:
         """
         Valida un token JWT para acceso VNC.
-        
+
         Verifica que:
         - El token sea válido y no esté expirado
         - El token corresponda a la VM especificada
-        
+
         Args:
             token (str): Token JWT a validar
             vm_id (int): ID de la VM a verificar
-            
+
         Returns:
             bool: True si el token es válido, False en caso contrario
         """
         try:
             Logger.debug(f"Validando token VNC para VM ID-{vm_id}")
             payload = jwt.decode(token, self.secret_key, algorithms=['HS256'])
-            
+
             # Verificar que el token corresponde a la VM
             if payload['vm_id'] != int(vm_id):
                 Logger.warning(f"Token no corresponde a VM ID-{vm_id}")
                 return False
-            
-            Logger.success(f"Token validado correctamente para VM ID-{vm_id}")    
+
+            Logger.success(f"Token validado correctamente para VM ID-{vm_id}")
             return True
-            
+
         except jwt.ExpiredSignatureError:
             Logger.warning(f"Token expirado para VM ID-{vm_id}")
             return False
-            
+
         except jwt.InvalidTokenError as e:
             Logger.error(f"Token inválido para VM ID-{vm_id}: {str(e)}")
             return False
-            
+
         except Exception as e:
             Logger.error(f"Error validando token VNC: {str(e)}")
             return False
@@ -439,7 +439,7 @@ class JWTManager:
     """
     Manejador de tokens JWT usando llave pública RSA.
     """
-    
+
     PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy3uQ4UZwnOu7C/Xyp5YA
 7j4wtSrf78XHI8z8pKmaa6t7hB/Mj/+p1eVvzbWMWBnAhybg2llTyMp73B2lbduG
@@ -466,10 +466,10 @@ lQIDAQAB
     def get_username_from_token(self, token: str) -> Optional[str]:
         """
         Obtiene el username del token JWT.
-        
+
         Args:
             token (str): Token JWT completo (incluyendo 'Bearer ')
-            
+
         Returns:
             Optional[str]: Username extraído o None si hay error
         """
@@ -485,12 +485,12 @@ lQIDAQAB
                 algorithms=['RS256'],
                 options={"verify_signature": True}
             )
-            
+
             # El username está en el claim 'sub'
             username = decoded.get('sub')
             Logger.debug(f"Username extraído del token: {username}")
             return username
-            
+
         except jwt.ExpiredSignatureError:
             Logger.warning("Token expirado")
             return None
@@ -500,45 +500,45 @@ lQIDAQAB
         except Exception as e:
             Logger.error(f"Error procesando token: {str(e)}")
             return None
-    
+
     def validate_token(self, token: str) -> bool:
         """
         Valida un token JWT.
-        
+
         Args:
             token (str): Token JWT a validar
-            
+
         Returns:
             bool: True si el token es válido
         """
         try:
             if token.startswith('Bearer '):
                 token = token[7:]
-                
+
             decoded = jwt.decode(
                 token,
                 self.public_key,
                 algorithms=['RS256']
             )
-            
+
             # Verificar expiración
             exp = decoded.get('exp')
             if exp and datetime.fromtimestamp(exp) < datetime.utcnow():
                 return False
-                
+
             return True
-            
+
         except:
             return False
 
     def get_user_id_from_username(self, username: str, db) -> Optional[int]:
         """
         Obtiene el ID del usuario desde la base de datos.
-        
+
         Args:
             username (str): Username a buscar
             db: Instancia de DatabaseManager
-            
+
         Returns:
             Optional[int]: ID del usuario o None si no se encuentra
         """
@@ -557,10 +557,10 @@ lQIDAQAB
     def get_role_from_token(self, token: str) -> Optional[str]:
         """
         Obtiene el rol del usuario desde el token JWT.
-        
+
         Args:
             token (str): Token JWT completo (incluyendo 'Bearer ')
-            
+
         Returns:
             Optional[str]: Rol del usuario o None si hay error
         """
@@ -576,12 +576,12 @@ lQIDAQAB
                 algorithms=['RS256'],
                 options={"verify_signature": True}
             )
-            
+
             # El rol está en el claim 'roles'
             roles = decoded.get('roles')
             Logger.debug(f"Roles extraídos del token: {roles}")
             return roles
-            
+
         except jwt.ExpiredSignatureError:
             Logger.warning("Token expirado")
             return None
@@ -595,16 +595,16 @@ lQIDAQAB
 class DatabaseManager:
     """
     Gestor de conexiones y operaciones con la base de datos MySQL.
-    
+
     Esta clase maneja un pool de conexiones y proporciona métodos para:
     - Ejecutar queries individuales
     - Ejecutar transacciones con múltiples queries
     - Obtener resultados en formato de diccionario
-    
+
     Atributos:
         cnx_pool: Pool de conexiones MySQL configurado con POOL_CONFIG
     """
-    
+
     def __init__(self):
         """
         Inicializa el gestor creando el pool de conexiones MySQL.
@@ -621,10 +621,10 @@ class DatabaseManager:
     def get_connection(self):
         """
         Obtiene una conexión del pool.
-        
+
         Returns:
             MySQLConnection: Una conexión activa del pool
-            
+
         Raises:
             PoolError: Si no hay conexiones disponibles en el pool
         """
@@ -639,14 +639,14 @@ class DatabaseManager:
     def execute_query(self, query: str, params: tuple = None) -> List[Dict]:
         """
         Ejecuta una query SQL y retorna los resultados.
-        
+
         Args:
             query (str): Query SQL a ejecutar
             params (tuple, optional): Parámetros para la query
-            
+
         Returns:
             List[Dict]: Lista de resultados donde cada fila es un diccionario
-            
+
         Raises:
             Exception: Si hay error ejecutando la query
         """
@@ -654,7 +654,7 @@ class DatabaseManager:
             Logger.debug(f"Ejecutando query: {query}")
             if params:
                 Logger.debug(f"Parámetros: {params}")
-                
+
             with self.get_connection() as cnx:
                 with cnx.cursor(dictionary=True) as cursor:
                     cursor.execute(query, params)
@@ -664,7 +664,7 @@ class DatabaseManager:
                         return results
                     Logger.debug("Query ejecutada sin resultados")
                     return []
-                    
+
         except Exception as e:
             Logger.error(f"Error ejecutando query: {str(e)}")
             Logger.debug(f"Query: {query}")
@@ -674,19 +674,19 @@ class DatabaseManager:
     def execute_transaction(self, queries: List[Tuple[str, tuple]]) -> bool:
         """
         Ejecuta múltiples queries en una transacción atómica.
-        
+
         Args:
             queries (List[Tuple[str, tuple]]): Lista de tuplas (query, params)
-            
+
         Returns:
             bool: True si la transacción fue exitosa
-            
+
         Raises:
             Exception: Si hay error en la transacción (se hace rollback)
         """
         try:
             Logger.debug(f"Iniciando transacción con {len(queries)} queries")
-            
+
             with self.get_connection() as cnx:
                 with cnx.cursor() as cursor:
                     for i, (query, params) in enumerate(queries, 1):
@@ -694,12 +694,12 @@ class DatabaseManager:
                         Logger.debug(f"Query: {query}")
                         Logger.debug(f"Parámetros: {params}")
                         cursor.execute(query, params)
-                        
+
                 Logger.debug("Haciendo commit de la transacción")
                 cnx.commit()
                 Logger.success("Transacción completada exitosamente")
                 return True
-                
+
         except Exception as e:
             Logger.error(f"Error en transacción: {str(e)}")
             Logger.warning("Ejecutando rollback")
@@ -707,15 +707,75 @@ class DatabaseManager:
                 cnx.rollback()
             raise
 
+    def start_transaction(self):
+        """
+        Inicia una transacción manual y retorna la conexión y cursor.
+
+        Returns:
+            tuple: (conexión, cursor) para usar en la transacción
+        """
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor(dictionary=True)
+            return conn, cursor
+        except Exception as e:
+            Logger.error(f"Error iniciando transacción: {str(e)}")
+            raise
+
+    def commit_transaction(self, conn):
+        """
+        Confirma una transacción manual.
+
+        Args:
+            conn: Conexión a la BD con transacción activa
+        """
+        try:
+            conn.commit()
+            Logger.debug("Transacción confirmada exitosamente")
+        except Exception as e:
+            Logger.error(f"Error confirmando transacción: {str(e)}")
+            raise
+
+    def rollback_transaction(self, conn):
+        """
+        Revierte una transacción manual.
+
+        Args:
+            conn: Conexión a la BD con transacción activa
+        """
+        try:
+            conn.rollback()
+            Logger.debug("Transacción revertida exitosamente")
+        except Exception as e:
+            Logger.error(f"Error revirtiendo transacción: {str(e)}")
+            raise
+
+    def close_transaction(self, conn, cursor):
+        """
+        Cierra los recursos de una transacción manual.
+
+        Args:
+            conn: Conexión a la BD
+            cursor: Cursor de la conexión
+        """
+        try:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+            Logger.debug("Recursos de transacción cerrados")
+        except Exception as e:
+            Logger.error(f"Error cerrando recursos de transacción: {str(e)}")
+
 class RequestValidator:
     """
     Validador de requests para creación y gestión de slices.
-    
+
     Esta clase proporciona métodos estáticos para validar:
     - Estructura y campos requeridos en requests de creación de slices
     - Referencias a recursos (flavors, images)
     - Consistencia de topología (VMs, links, interfaces)
-    
+
     Attributes:
         None - Clase con métodos estáticos
     """
@@ -724,17 +784,17 @@ class RequestValidator:
     def validate_slice_request(request_data: dict) -> Tuple[bool, str]:
         """
         Valida la estructura y contenido de un request para crear slice.
-        
+
         Validaciones:
         1. Estructura básica del request
         2. Campos requeridos en slice_info
         3. Estructura de topology_info
         4. Existencia de flavors e images referenciados
         5. Consistencia de links e interfaces
-        
+
         Args:
             request_data (dict): Datos del request a validar
-            
+
         Returns:
             Tuple[bool, str]: (éxito, mensaje de error si falla)
         """
@@ -795,7 +855,7 @@ class RequestValidator:
 
             # 5. Validar Links e Interfaces
             Logger.debug("Validando links e interfaces...")
-            
+
             # Validar links
             link_ids = set()
             for link in topology['links']:
@@ -815,24 +875,24 @@ class RequestValidator:
                 if not all(key in iface for key in ['id', 'name', 'vm_id', 'link_id']):
                     Logger.error("Interface con campos faltantes")
                     return False, "Cada interface debe tener: id, name, vm_id, link_id"
-                
+
                 # Validar IDs únicos
                 if iface['id'] in interface_ids:
                     Logger.error(f"ID de interface duplicado: {iface['id']}")
                     return False, f"ID de interface duplicado: {iface['id']}"
-                
+
                 # Validar referencias
                 if iface['vm_id'] not in vm_ids:
                     Logger.error(f"Interface referencia VM inexistente: {iface['vm_id']}")
                     return False, f"Interface referencia a VM inexistente: {iface['vm_id']}"
-                
+
                 # Validar link_id para interfaces no externas
                 if iface['link_id'] not in link_ids and not iface.get('external_access'):
                     Logger.error(f"Interface referencia link inexistente: {iface['link_id']}")
                     return False, f"Interface referencia a Link inexistente: {iface['link_id']}"
-                
+
                 interface_ids.add(iface['id'])
-                
+
                 # Validar external_access
                 if 'external_access' in iface and not isinstance(iface['external_access'], bool):
                     Logger.error("external_access debe ser booleano")
@@ -849,11 +909,11 @@ class RequestValidator:
     def validate_resources(self, flavor_id: str, image_id: str) -> Tuple[bool, str]:
         """
         Valida que los recursos solicitados existan y estén activos.
-        
+
         Args:
             flavor_id (str): ID del flavor a validar
             image_id (str): ID de la imagen a validar
-            
+
         Returns:
             Tuple[bool, str]: (éxito, mensaje de error si falla)
         """
@@ -880,7 +940,7 @@ class RequestValidator:
 
             Logger.success("Recursos validados exitosamente")
             return True, ""
-            
+
         except Exception as e:
             Logger.error(f"Error validando recursos: {str(e)}")
             Logger.debug(f"Traceback: {traceback.format_exc()}")
@@ -889,178 +949,207 @@ class RequestValidator:
 class WorkerAssigner:
     """
     Asignador de workers y displays VNC para máquinas virtuales.
-    
+
     Esta clase maneja la asignación de:
     - Workers físicos para hospedar VMs
     - Displays VNC disponibles en cada worker
     - Distribución balanceada de VMs entre workers
-    
+
     Attributes:
         db: Instancia de DatabaseManager para consultas a BD
     """
-    
+
     def __init__(self, db):
         """
         Inicializa el asignador de workers.
-        
+
         Args:
             db: Instancia de DatabaseManager
         """
         self.db = db
         Logger.info("WorkerAssigner inicializado")
 
-    def get_active_workers(self) -> List[Dict]:
+    def get_active_workers_with_lock(self, cursor) -> List[Dict]:
         """
         Obtiene la lista de workers activos disponibles.
-        
+
+        Args:
+            cursor: Cursor de transacción activa
+
         Returns:
             List[Dict]: Lista de workers con sus IDs y nombres
                 [{"id": int, "name": str}, ...]
-                
+
         Raises:
             Exception: Si hay error consultando la BD
         """
         try:
-            Logger.debug("Consultando workers activos...")
-            workers = self.db.execute_query(
-                """SELECT id, name 
-                   FROM physical_server 
-                   WHERE server_type = 'worker' 
-                   AND status = 'active'
-                   LIMIT 3""" # Temporal para pruebas, ya que solo usamos los workers de un mismo slice!
+            Logger.debug("Consultando workers activos con bloqueo...")
+            cursor.execute(
+                """SELECT id, name
+                   FROM physical_server
+                   WHERE server_type = 'worker'
+                     AND status = 'active' LIMIT 3
+                        FOR
+                UPDATE"""  # Bloquear registros
             )
+            workers = cursor.fetchall()
             Logger.info(f"Workers activos encontrados: {len(workers)}")
             Logger.debug(f"Workers: {[w['name'] for w in workers]}")
             return workers
-            
+
         except Exception as e:
             Logger.error(f"Error obteniendo workers activos: {str(e)}")
             raise
 
-    def get_worker_vnc_displays(self, worker_id: int) -> List[int]:
+    def get_worker_vnc_displays_with_lock(self, worker_id: int, cursor) -> List[int]:
         """
-        Obtiene displays VNC disponibles para un worker específico.
-        
-        Busca displays en uso y encuentra números disponibles en el rango 1-100.
-        
+        Obtiene displays VNC disponibles para un worker específico con bloqueo.
+
         Args:
             worker_id (int): ID del worker
-            
+            cursor: Cursor de transacción activa
+
         Returns:
             List[int]: Lista de números de display disponibles
-            
-        Raises:
-            Exception: Si hay error consultando la BD
         """
         try:
-            Logger.debug(f"Consultando displays VNC para worker {worker_id}")
-            
-            # Obtener displays en uso
-            query = """
-                SELECT vnc_display 
-                FROM virtual_machine 
-                WHERE physical_server = %s 
-                AND status != 'stopped' 
+            Logger.debug(f"Consultando displays VNC para worker {worker_id} con bloqueo")
+
+            # Obtener displays en uso con bloqueo
+            cursor.execute(
+                """SELECT vnc_display
+                   FROM virtual_machine
+                   WHERE physical_server = %s
+                     AND status != 'stopped' 
                 AND vnc_display IS NOT NULL
-                ORDER BY vnc_display
-            """
+                FOR
+                UPDATE""",  # Bloquear registros
+                (worker_id,)
+            )
+
             used_displays = [
-                vm['vnc_display'] 
-                for vm in self.db.execute_query(query, (worker_id,))
-                if vm['vnc_display'] is not None
+                row['vnc_display']
+                for row in cursor.fetchall()
+                if row['vnc_display'] is not None
             ]
-            
+
             Logger.debug(f"Displays en uso: {used_displays}")
-            
+
             # Calcular displays disponibles
             available_displays = []
             current = 1
-            
+
             if not used_displays:
                 Logger.debug("No hay displays en uso, retornando rango completo")
                 return list(range(1, 101))
-                
+
             # Encontrar huecos en la secuencia
-            for display in used_displays:
+            for display in sorted(used_displays):
                 while current < display:
                     available_displays.append(current)
                     current += 1
                 current = display + 1
-                
+
             # Agregar displays después del último usado
             while len(available_displays) < 100:
                 available_displays.append(current)
                 current += 1
-                
+
             Logger.debug(f"Displays disponibles: {len(available_displays)}")
             Logger.debug(f"Primer display disponible: {available_displays[0] if available_displays else None}")
-            
+
             return available_displays
-            
+
         except Exception as e:
-            Logger.error(f"Error obteniendo displays VNC: {str(e)}")
+            Logger.error(f"Error obteniendo displays VNC con bloqueo: {str(e)}")
             raise
 
-    def assign_workers_and_displays(self, vms: List[Dict]) -> Dict[int, Dict]:
+    def assign_workers_and_displays_with_lock(self, vms: List[Dict], conn, cursor) -> Dict[int, Dict]:
         """
-        Asigna workers y displays VNC a las VMs usando round-robin.
-        Asegura que cada VM en un mismo worker tenga un display VNC único.
+        Asigna workers y displays VNC a las VMs usando round-robin con bloqueo.
+
+        Args:
+            vms: Lista de VMs a asignar
+            conn: Conexión a la BD
+            cursor: Cursor de la transacción
+
+        Returns:
+            Dict: Asignaciones de workers y displays
         """
         try:
-            Logger.section(f"Asignando workers y displays para {len(vms)} VMs")
-            
-            # Obtener workers activos
-            workers = self.get_active_workers()
+            Logger.section(f"Asignando workers y displays para {len(vms)} VMs con bloqueo")
+
+            # Obtener workers activos con bloqueo
+            cursor.execute(
+                """SELECT id, name
+                   FROM physical_server
+                   WHERE server_type = 'worker'
+                     AND status = 'active'
+                       FOR UPDATE""",  # Bloquear workers activos
+                ()
+            )
+            workers = cursor.fetchall()
+
             if not workers:
                 Logger.error("No hay workers activos disponibles")
                 raise Exception("No hay workers activos disponibles")
-            
+
             Logger.info(f"Workers disponibles: {len(workers)}")
-            
-            # Diccionario para rastrear displays usados por worker
+
+            # Inicializar tracking de displays por worker
             worker_displays_used = {}
-            worker_available_displays = {}
-            
-            # Inicializar displays disponibles por worker
+            assignments = {}
+
+            # Para cada worker, obtener displays disponibles con bloqueo
             for worker in workers:
                 worker_id = worker['id']
-                displays = self.get_worker_vnc_displays(worker_id)
-                worker_available_displays[worker_id] = displays
+                available_displays = self.get_worker_vnc_displays_with_lock(worker_id, cursor)
                 worker_displays_used[worker_id] = set()
-                Logger.debug(f"Worker {worker['name']} (ID-{worker_id}): {len(displays)} displays disponibles")
-                Logger.debug(f"Displays disponibles: {displays[:5]}...")
+                Logger.debug(
+                    f"Worker {worker['name']} (ID-{worker_id}): {len(available_displays)} displays disponibles")
 
-            # Asignar VMs usando round-robin
-            assignments = {}
-            assigned_workers = []  # Para mantener el orden de asignación
+            # Asignar VMs usando round-robin (similar al método original)
+            assigned_workers = []
 
             for i, vm in enumerate(vms):
                 # Seleccionar worker por round-robin
                 worker = workers[i % len(workers)]
                 worker_id = worker['id']
                 assigned_workers.append(worker['name'])
-                
-                Logger.debug(f"\nAsignando VM-{vm['id']}:")
+
+                Logger.debug(f"Asignando VM-{vm['id']}:")
                 Logger.debug(f"- Worker seleccionado: {worker['name']} (ID-{worker_id})")
-                Logger.debug(f"- Displays ya usados en este worker: {worker_displays_used[worker_id]}")
-                
-                # Obtener siguiente display disponible para este worker
-                available_displays = worker_available_displays[worker_id]
+
+                # Obtener siguiente display disponible con bloqueo
+                available_displays = self.get_worker_vnc_displays_with_lock(worker_id, cursor)
                 used_displays = worker_displays_used[worker_id]
-                
+
                 # Encontrar el primer display disponible que no esté en uso
                 display = None
                 for d in available_displays:
                     if d not in used_displays:
                         display = d
                         used_displays.add(d)  # Marcar como usado
-                        Logger.debug(f"- Display asignado: {display}")
+
+                        # Reservar display en la base de datos
+                        cursor.execute(
+                            """INSERT INTO worker_vnc_reservation
+                                   (worker_id, vnc_display, vm_id, reserved_at)
+                               VALUES (%s, %s, %s, NOW()) ON DUPLICATE KEY
+                            UPDATE
+                                vm_id =
+                            VALUES (vm_id), reserved_at = NOW()""",
+                            (worker_id, display, vm['id'])
+                        )
+
+                        Logger.debug(f"- Display asignado y reservado: {display}")
                         break
-                        
+
                 if display is None:
                     Logger.error(f"No hay displays VNC disponibles en worker {worker['name']}")
                     raise Exception(f"No hay displays VNC disponibles en worker {worker['name']}")
-                
+
                 assignments[vm['id']] = {
                     'worker': {
                         'id': worker['id'],
@@ -1068,7 +1157,7 @@ class WorkerAssigner:
                     },
                     'vnc_display': display
                 }
-                
+
                 Logger.info(
                     f"VM ID-{vm['id']} asignada a Worker con nombre {worker['name']} (ID-{worker_id}) con Display N°{display}"
                 )
@@ -1082,156 +1171,185 @@ class WorkerAssigner:
 
             Logger.success(f"Asignación completada: {len(assignments)} VMs distribuidas")
             return assignments
-                
+
         except Exception as e:
-            Logger.error(f"Error en assign_workers_and_displays: {str(e)}")
+            Logger.error(f"Error en assign_workers_and_displays_with_lock: {str(e)}")
             raise
-    
+
 class SliceProcessor:
     """
     Procesador de solicitudes y recursos para slices.
-    
+
     Esta clase maneja:
     - Generación de IDs secuenciales para recursos (slices, VMs, links, etc.)
     - Gestión de VLANs (SVLAN/CVLAN)
     - Asignación de displays VNC
     - Obtención de información de recursos (flavors, images, workers)
-    
+
     Attributes:
         db: Instancia global de DatabaseManager
         worker_assigner: Instancia de WorkerAssigner para asignar workers
     """
-    
+
     def __init__(self):
         """Inicializa el procesador de slices"""
         self.db = db  # Usar el DatabaseManager global
         self.worker_assigner = WorkerAssigner(db)
         Logger.info("SliceProcessor inicializado")
-        
-    def get_next_slice_id(self) -> int:
+
+    def get_next_slice_id_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente ID disponible para slice.
-        
+        Obtiene el siguiente ID disponible para slice con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente ID disponible (>= 100)
         """
         try:
-            Logger.debug("Obteniendo siguiente ID de slice")
-            result = self.db.execute_query("SELECT MAX(id) as max_id FROM slice")
-            next_id = (result[0]['max_id'] or 100) + 1
-            Logger.debug(f"Siguiente ID de slice: {next_id}")
+            Logger.debug("Obteniendo siguiente ID de slice con bloqueo")
+            cursor.execute("SELECT MAX(id) as max_id FROM slice FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 100) + 1
+
+            # Crear reserva temporal del ID
+            cursor.execute(
+                """INSERT INTO slice
+                       (id, name, description, status, created_at)
+                   VALUES (%s, %s, %s, %s, NOW())""",
+                (next_id, f"temp_slice_{next_id}", "Reserva temporal de ID", "reserving")
+            )
+
+            Logger.debug(f"ID de slice reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente ID de slice: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente ID de slice con bloqueo: {str(e)}")
             raise
-        
-    def get_next_svlan(self) -> int:
+
+    def get_next_svlan_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente SVLAN ID disponible.
-        
+        Obtiene el siguiente SVLAN ID disponible con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente SVLAN ID (>= 100)
         """
         try:
-            Logger.debug("Obteniendo siguiente SVLAN ID")
-            result = self.db.execute_query(
-                "SELECT MAX(svlan_id) as max_id FROM slice_network"
-            )
-            next_id = (result[0]['max_id'] or 100) + 1
-            Logger.debug(f"Siguiente SVLAN ID: {next_id}")
+            Logger.debug("Obteniendo siguiente SVLAN ID con bloqueo")
+            cursor.execute("SELECT MAX(svlan_id) as max_id FROM slice_network FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 100) + 1
+            Logger.debug(f"SVLAN ID reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente SVLAN ID: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente SVLAN ID con bloqueo: {str(e)}")
             raise
-        
-    def get_next_cvlan(self) -> int:
+
+    def get_next_cvlan_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente CVLAN ID disponible.
-        
+        Obtiene el siguiente CVLAN ID disponible con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente CVLAN ID (>= 1)
         """
         try:
-            Logger.debug("Obteniendo siguiente CVLAN ID")
-            result = self.db.execute_query(
-                "SELECT MAX(cvlan_id) as max_id FROM link"
-            )
-            next_id = (result[0]['max_id'] or 0) + 1
-            Logger.debug(f"Siguiente CVLAN ID: {next_id}")
+            Logger.debug("Obteniendo siguiente CVLAN ID con bloqueo")
+            cursor.execute("SELECT MAX(cvlan_id) as max_id FROM link FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 0) + 1
+            Logger.debug(f"CVLAN ID reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente CVLAN ID: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente CVLAN ID con bloqueo: {str(e)}")
             raise
-    
-    def get_next_vm_id(self) -> int:
+
+    def get_next_vm_id_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente ID disponible para VMs.
-        
+        Obtiene el siguiente ID disponible para VMs con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente VM ID (>= 1)
         """
         try:
-            Logger.debug("Obteniendo siguiente ID de VM")
-            result = self.db.execute_query(
-                "SELECT MAX(id) as max_id FROM virtual_machine"
-            )
-            next_id = (result[0]['max_id'] or 0) + 1
-            Logger.debug(f"Siguiente ID de VM: {next_id}")
+            Logger.debug("Obteniendo siguiente ID de VM con bloqueo")
+            cursor.execute("SELECT MAX(id) as max_id FROM virtual_machine FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 0) + 1
+            Logger.debug(f"ID de VM reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente ID de VM: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente ID de VM con bloqueo: {str(e)}")
             raise
 
-    def get_next_link_id(self) -> int:
+    def get_next_link_id_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente ID disponible para links.
-        
+        Obtiene el siguiente ID disponible para links con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente link ID (>= 1)
         """
         try:
-            Logger.debug("Obteniendo siguiente ID de link")
-            result = self.db.execute_query(
-                "SELECT MAX(id) as max_id FROM link"
-            )
-            next_id = (result[0]['max_id'] or 0) + 1
-            Logger.debug(f"Siguiente ID de link: {next_id}")
+            Logger.debug("Obteniendo siguiente ID de link con bloqueo")
+            cursor.execute("SELECT MAX(id) as max_id FROM link FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 0) + 1
+            Logger.debug(f"ID de link reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente ID de link: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente ID de link con bloqueo: {str(e)}")
             raise
 
-    def get_next_interface_id(self) -> int:
+    def get_next_interface_id_with_lock(self, conn, cursor) -> int:
         """
-        Obtiene el siguiente ID disponible para interfaces.
-        
+        Obtiene el siguiente ID disponible para interfaces con bloqueo.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
         Returns:
             int: Siguiente interface ID (>= 1)
         """
         try:
-            Logger.debug("Obteniendo siguiente ID de interface")
-            result = self.db.execute_query(
-                "SELECT MAX(id) as max_id FROM interface"
-            )
-            next_id = (result[0]['max_id'] or 0) + 1
-            Logger.debug(f"Siguiente ID de interface: {next_id}")
+            Logger.debug("Obteniendo siguiente ID de interface con bloqueo")
+            cursor.execute("SELECT MAX(id) as max_id FROM interface FOR UPDATE")
+            result = cursor.fetchone()
+            next_id = (result['max_id'] or 0) + 1
+            Logger.debug(f"ID de interface reservado: {next_id}")
             return next_id
         except Exception as e:
-            Logger.error(f"Error obteniendo siguiente ID de interface: {str(e)}")
+            Logger.error(f"Error obteniendo siguiente ID de interface con bloqueo: {str(e)}")
             raise
-    
+
     def get_available_vnc_displays(self) -> List[int]:
         """
         Obtiene números de display VNC disponibles.
-        
+
         Busca displays en uso y encuentra números disponibles en el rango 1-100.
-        
+
         Returns:
             List[int]: Lista de números de display disponibles
         """
         try:
             Logger.debug("Obteniendo displays VNC disponibles")
-            
+
             # Obtener displays en uso
             query = """
                 SELECT vnc_display 
@@ -1241,71 +1359,71 @@ class SliceProcessor:
                 ORDER BY vnc_display
             """
             used_displays = [
-                vm['vnc_display'] 
+                vm['vnc_display']
                 for vm in self.db.execute_query(query)
             ]
             Logger.debug(f"Displays en uso: {used_displays}")
-            
+
             # Calcular displays disponibles
             available_displays = []
             current = 1
-            
+
             if not used_displays:
                 Logger.debug("No hay displays en uso, retornando rango completo")
                 return list(range(1, 101))
-                
+
             # Encontrar huecos en la secuencia
             for display in used_displays:
                 while current < display:
                     available_displays.append(current)
                     current += 1
                 current = display + 1
-            
+
             # Agregar displays después del último usado
             while len(available_displays) < 100:
                 available_displays.append(current)
                 current += 1
-                
+
             Logger.debug(f"Displays disponibles: {len(available_displays)}")
             return available_displays
-            
+
         except Exception as e:
             Logger.error(f"Error obteniendo displays VNC: {str(e)}")
             raise
-    
+
     def get_resource_info(self, flavor_id: str, image_id: str) -> Tuple[Dict, Dict]:
         """
         Obtiene información detallada de flavor e imagen.
-        
+
         Args:
             flavor_id (str): ID del flavor
             image_id (str): ID de la imagen
-            
+
         Returns:
             Tuple[Dict, Dict]: (info_flavor, info_imagen)
         """
         try:
             Logger.debug(f"Obteniendo info de recursos - Flavor: {flavor_id}, Image: {image_id}")
-            
+
             # Obtener flavor
             flavor = self.db.execute_query(
                 """SELECT id, name, vcpus, ram, disk 
                    FROM flavor 
-                   WHERE id = %s""", 
+                   WHERE id = %s""",
                 (flavor_id,)
             )[0]
-            
+
             # Obtener imagen
             image = self.db.execute_query(
                 """SELECT id, name, path
                    FROM image 
-                   WHERE id = %s""", 
+                   WHERE id = %s""",
                 (image_id,)
             )[0]
-            
+
             Logger.debug(f"Info obtenida - Flavor: {flavor['name']}, Image: {image['name']}")
             return flavor, image
-            
+
         except Exception as e:
             Logger.error(f"Error obteniendo info de recursos: {str(e)}")
             raise
@@ -1313,16 +1431,16 @@ class SliceProcessor:
     def get_worker_info(self, worker_id: int) -> Dict:
         """
         Obtiene información detallada del worker.
-        
+
         Args:
             worker_id (int): ID del worker físico
-            
+
         Returns:
             Dict: Información completa del worker
         """
         try:
             Logger.debug(f"Obteniendo información del worker {worker_id}")
-            
+
             worker = self.db.execute_query(
                 """SELECT id, name, ip, data_ip, 
                     ssh_username, ssh_password, ssh_key_path,
@@ -1332,7 +1450,7 @@ class SliceProcessor:
                 WHERE id = %s""",
                 (worker_id,)
             )[0]
-            
+
             worker_info = {
                 'id': worker['id'],
                 'name': worker['name'],
@@ -1345,10 +1463,10 @@ class SliceProcessor:
                 'gateway_access_port': worker['gateway_access_port'],
                 'switch_name': worker['switch_name']
             }
-            
+
             Logger.debug(f"Información obtenida para worker {worker['name']}")
             return worker_info
-            
+
         except Exception as e:
             Logger.error(f"Error obteniendo info del worker: {str(e)}")
             raise
@@ -1356,7 +1474,7 @@ class SliceProcessor:
     def assign_worker(self, vm_index: int) -> dict:
         """
         Asigna un worker para una VM usando distribución round-robin.
-        
+
         Asigna workers activos de forma balanceada usando el índice de la VM
         para distribuir la carga entre los workers disponibles.
 
@@ -1366,7 +1484,7 @@ class SliceProcessor:
         Returns:
             dict: Información del worker asignado
                 {
-                    "name": str,  # Nombre del worker 
+                    "name": str,  # Nombre del worker
                     "id": int     # ID del worker
                 }
 
@@ -1375,26 +1493,26 @@ class SliceProcessor:
         """
         try:
             Logger.debug(f"Asignando worker para VM índice {vm_index}")
-            
+
             workers = self.db.execute_query(
                 """SELECT id, name 
                 FROM physical_server 
                 WHERE server_type = 'worker' 
                 AND status = 'active'"""
             )
-            
+
             if not workers:
                 Logger.error("No hay workers activos disponibles")
                 raise Exception("No hay workers disponibles")
-                
+
             selected_worker = workers[vm_index % len(workers)]
             Logger.success(f"Worker {selected_worker['name']} asignado para VM índice {vm_index}")
-            
+
             return {
                 "name": selected_worker['name'],
                 "id": selected_worker['id']
             }
-            
+
         except Exception as e:
             Logger.error(f"Error asignando worker: {str(e)}")
             raise
@@ -1429,10 +1547,10 @@ class SliceProcessor:
                 }
         """
         Logger.debug(f"Generando configuración de red - Slice: ID-{slice_id}, SVLAN: {svlan_id}")
-    
+
         # Calcular el último octeto para la red (usar módulo para mantener en rango válido)
         network_octet = svlan_id % 256
-        
+
         config = {
             "slice_id": slice_id,
             "svlan_id": svlan_id,
@@ -1449,14 +1567,14 @@ class SliceProcessor:
             "dhcp_interface": f"veth-int.{slice_id}",
             "gateway_interface": f"gw-{slice_id}"
         }
-        
+
         Logger.debug(f"Configuración generada: {json.dumps(config, indent=2)}")
         return config
 
     def generate_mac_address(self, slice_id: int, interface_id: int, vm_id: int) -> str:
         """
         Genera una dirección MAC única para una interfaz.
-        
+
         Usa el formato QEMU estándar (52:54:00) seguido de identificadores únicos:
         - 52:54:00 - Prefijo estándar QEMU
         - SS - Hash del slice_id (2 dígitos hex)
@@ -1465,7 +1583,7 @@ class SliceProcessor:
 
         Args:
             slice_id (int): ID de la slice (cualquier entero positivo)
-            interface_id (int): ID de la interfaz (cualquier entero positivo) 
+            interface_id (int): ID de la interfaz (cualquier entero positivo)
             vm_id (int): ID de la VM (cualquier entero positivo)
 
         Returns:
@@ -1478,17 +1596,17 @@ class SliceProcessor:
 
         # Convertir IDs grandes a valores de 2 dígitos hex usando módulo
         slice_hex = f"{slice_id % 256:02x}"
-        if_hex = f"{interface_id % 256:02x}"  
+        if_hex = f"{interface_id % 256:02x}"
         vm_hex = f"{vm_id % 256:02x}"
 
         mac = f"52:54:00:{slice_hex}:{vm_hex}:{if_hex}"
         Logger.debug(f"MAC generada: {mac}")
-        
+
         return mac
 
-    def process_request(self, request_data: dict) -> dict:
+    def process_request_with_transaction(self, request_data: dict) -> dict:
         """
-        Procesa la solicitud y genera la configuración completa de la slice.
+         Procesa la solicitud y genera la configuración completa de la slice usando transacciones.
 
         Este método realiza:
         1. Generación de IDs secuenciales para todos los recursos
@@ -1513,48 +1631,29 @@ class SliceProcessor:
         Raises:
             Exception: Si hay error en el procesamiento
         """
+        conn = None
+        cursor = None
         try:
             Logger.section("PROCESANDO REQUEST DE SLICE")
             Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
-            # Generar IDs secuenciales
-            Logger.subsection("Generando IDs secuenciales")
-            
-            # Obtener siguiente ID de slice (desde 100)
-            Logger.debug("Obteniendo siguiente ID de slice")
-            result = db.execute_query("SELECT MAX(id) as max_id FROM slice")
-            next_slice_id = max(100, (result[0]['max_id'] or 99) + 1)
-            Logger.debug(f"Siguiente ID de slice: {next_slice_id}")
+            # Iniciar transacción
+            conn, cursor = db.start_transaction()
 
-            # Usar el mismo ID para el SVLAN
-            svlan_id = next_slice_id
-            Logger.debug(f"SVLAN ID asignado: {svlan_id}")
+            # 1. Generar IDs secuenciales con bloqueo
+            slice_id = self.get_next_slice_id_with_lock(conn, cursor)
+            svlan_id = slice_id  # Usar el mismo ID para SVLAN
+            vm_start_id = self.get_next_vm_id_with_lock(conn, cursor)
+            link_start_id = self.get_next_link_id_with_lock(conn, cursor)
+            interface_start_id = self.get_next_interface_id_with_lock(conn, cursor)
+            base_cvlan = self.get_next_cvlan_with_lock(conn, cursor)
 
-            # Resto de IDs (mantener la lógica existente para otros IDs)
-            Logger.debug("Obteniendo siguiente ID de VM")
-            result = db.execute_query("SELECT MAX(id) as max_id FROM virtual_machine")
-            next_vm_id = (result[0]['max_id'] or 0) + 1
-
-            Logger.debug("Obteniendo siguiente ID de link")
-            result = db.execute_query("SELECT MAX(id) as max_id FROM link")
-            next_link_id = (result[0]['max_id'] or 0) + 1
-
-            Logger.debug("Obteniendo siguiente ID de interface")
-            result = db.execute_query("SELECT MAX(id) as max_id FROM interface")
-            next_interface_id = (result[0]['max_id'] or 0) + 1
-
-            Logger.info(f"IDs generados:")
-            Logger.info(f"                - Slice ID: {next_slice_id}")
+            Logger.info(f"IDs reservados con bloqueo:")
+            Logger.info(f"                - Slice ID: {slice_id}")
             Logger.info(f"                - SVLAN ID: {svlan_id}")
-            Logger.info(f"                - VM Start ID: {next_vm_id}")
-            Logger.info(f"                - Link Start ID: {next_link_id}")
-            Logger.info(f"                - Interface Start ID: {next_interface_id}")
-
-            slice_id = next_slice_id
-            vm_start_id = next_vm_id
-            link_start_id = next_link_id
-            interface_start_id = next_interface_id
-            base_cvlan = 10
+            Logger.info(f"                - VM Start ID: {vm_start_id}")
+            Logger.info(f"                - Link Start ID: {link_start_id}")
+            Logger.info(f"                - Interface Start ID: {interface_start_id}")
 
             # 2. Preparar información de la slice
             Logger.subsection("Preparando información de la slice")
@@ -1572,15 +1671,9 @@ class SliceProcessor:
             vm_id_mapping = {}
             link_id_mapping = {}
 
-            # Verificar displays VNC
-            available_displays = self.get_available_vnc_displays()
-            if len(available_displays) < len(topology['vms']):
-                Logger.error("No hay suficientes puertos VNC disponibles")
-                raise Exception("No hay suficientes puertos VNC disponibles")
-
             # Asignar workers y displays
-            worker_assignments = self.worker_assigner.assign_workers_and_displays(topology['vms'])
-            
+            worker_assignments = self.worker_assigner.assign_workers_and_displays_with_lock(topology['vms'], conn,
+                                                                                            cursor)
             Logger.info("Asignaciones de workers y displays VNC:")
             for vm_id, assignment in worker_assignments.items():
                 Logger.debug(
@@ -1600,13 +1693,31 @@ class SliceProcessor:
                 vm['status'] = 'preparing'
                 vm['physical_server'] = assignment['worker']
                 vm['vnc_display'] = assignment['vnc_display']
-                
+
+                # Reservar VM en la base de datos
+                cursor.execute(
+                    """INSERT INTO virtual_machine
+                           (id, name, slice, physical_server, status, vnc_display, vnc_port, image, flavor)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                        new_vm_id,
+                        vm['name'],
+                        slice_id,
+                        assignment['worker']['id'],
+                        'preparing',
+                        assignment['vnc_display'],
+                        5900 + assignment['vnc_display'] if assignment['vnc_display'] else None,
+                        vm['image_id'],
+                        vm['flavor_id']
+                    )
+                )
+
                 Logger.debug(
                     f"VM con nombre '{vm['name']}': ID {old_vm_id}->{new_vm_id}, "
                     f"Worker={vm['physical_server']['name']}"
                 )
 
-            # 4.2 Procesar Links
+            ## 4.2 Procesar Links
             Logger.debug("Procesando Links...")
             for i, link in enumerate(topology['links']):
                 old_link_id = link['id']
@@ -1615,7 +1726,15 @@ class SliceProcessor:
 
                 link['id'] = new_link_id
                 link['cvlan_id'] = base_cvlan + (i * 10)
-                
+
+                # Reservar Link en la base de datos
+                cursor.execute(
+                    """INSERT INTO link 
+                    (id, name, cvlan_id, slice_id)
+                    VALUES (%s, %s, %s, %s)""",
+                    (new_link_id, link['name'], link['cvlan_id'], slice_id)
+                )
+
                 Logger.debug(f"Link {link['name']}: ID {old_link_id}->{new_link_id}, CVLAN={link['cvlan_id']}")
 
             # 4.3 Procesar Interfaces
@@ -1639,7 +1758,7 @@ class SliceProcessor:
                     if new_link_id is None:
                         Logger.error(f"Link ID {old_link_id} no encontrado para interfaz {iface['name']}")
                         raise Exception(f"Link ID {old_link_id} no encontrado para la interfaz {iface['name']}")
-                    
+
                     iface['tap_name'] = f"t-V{new_vm_id}-S{slice_id}-{vm_interface_counters[new_vm_id]}"
                     iface['external_access'] = False
                     vm_interface_counters[new_vm_id] += 1
@@ -1648,7 +1767,23 @@ class SliceProcessor:
                 iface['vm_id'] = new_vm_id
                 iface['link_id'] = new_link_id
                 iface['mac_address'] = self.generate_mac_address(slice_id, new_if_id, new_vm_id)
-                
+
+                # Reservar Interface en la base de datos
+                cursor.execute(
+                    """INSERT INTO interface
+                           (id, name, mac, vm, link, external_access, tap_name)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        new_if_id,
+                        iface['name'],
+                        iface['mac_address'],
+                        new_vm_id,
+                        new_link_id,
+                        iface.get('external_access', False),
+                        iface['tap_name']
+                    )
+                )
+
                 Logger.debug(
                     f"Interface con nombre '{iface['name']}': ID-{new_if_id}, "
                     f"VM ID-{old_vm_id} -> ID-{new_vm_id}, "
@@ -1678,6 +1813,17 @@ class SliceProcessor:
                     resources_info['workers'][worker_id] = worker_info
                     Logger.debug(f"Agregada info de Worker {worker_info['name']}")
 
+            # Configurar estado de la slice como preparada
+            cursor.execute(
+                """UPDATE slice
+                   SET status = 'preparing'
+                   WHERE id = %s""",
+                (slice_id,)
+            )
+
+            # Confirmar transacción
+            conn.commit()
+
             # 6. Construir respuesta final
             Logger.success("Request procesado exitosamente")
             return {
@@ -1687,14 +1833,28 @@ class SliceProcessor:
                 "resources_info": resources_info
             }
 
+
         except Exception as e:
+            # Revertir transacción en caso de error
+            if conn:
+                try:
+                    conn.rollback()
+                    Logger.warning("Transacción revertida debido a error")
+                except:
+                    pass
             Logger.error(f"Error procesando request: {str(e)}")
             Logger.debug(f"Traceback: {traceback.format_exc()}")
             raise Exception(f"Error procesando solicitud: {str(e)}")
+        finally:
+            # Liberar recursos
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
 
-    def save_deployed_slice(self, deployed_data: dict) -> bool:
+    def save_deployed_slice_with_transaction(self, deployed_data: dict, user_id: int) -> bool:
         """
-        Guarda los datos de la slice después de un despliegue exitoso.
+        Guarda los datos de la slice después de un despliegue exitoso usando transacción.
 
         Guarda en la base de datos:
         1. Información básica de la slice
@@ -1715,102 +1875,135 @@ class SliceProcessor:
         Raises:
             Exception: Si hay error guardando los datos
         """
+        conn = None
+        cursor = None
         try:
             Logger.section(f"Guardando Slice Desplegado ID-{deployed_data['slice_info']['id']}")
             slice_info = deployed_data['slice_info']
+            slice_id = slice_info['id']
+
+            # Iniciar transacción
+            conn, cursor = db.start_transaction()
+
+            # Bloquear la slice para actualización
+            cursor.execute(
+                "SELECT id FROM slice WHERE id = %s FOR UPDATE",
+                (slice_id,)
+            )
+            if not cursor.fetchone():
+                Logger.warning(f"Slice ID-{slice_id} no encontrada para actualización")
+                raise Exception(f"Slice ID-{slice_id} no encontrada")
+
+            # Actualizar slice reservada
+            cursor.execute(
+                """UPDATE slice
+                   SET name        = %s,
+                       description = %s,
+                       status      = %s,
+                       created_at  = NOW()
+                   WHERE id = %s""",
+                (slice_info['name'], slice_info.get('description'), slice_info['status'], slice_id)
+            )
+
+            # Resto de inserciones y actualizaciones::
             network_config = deployed_data['network_config']
             topology = deployed_data['topology_info']
-            
-            queries = []
-            
-            # 1. Query para slice
-            Logger.debug("Preparando query de slice")
-            queries.append((
-                """INSERT INTO slice 
-                (id, name, description, status, created_at) 
-                VALUES (%s, %s, %s, %s, NOW())""",
-                (slice_info['id'], slice_info['name'], 
-                slice_info['description'], slice_info['status'])
-            ))
-            
-            # 2. Query para network config
-            Logger.debug("Preparando query de network config")
-            queries.append((
-                """INSERT INTO slice_network 
-                (slice_id, svlan_id, network, dhcp_range_start, dhcp_range_end, 
-                    slice_bridge_name, patch_port_slice, patch_port_int, 
+
+            # Network config
+            cursor.execute(
+                """INSERT INTO slice_network
+                   (slice_id, svlan_id, network, dhcp_range_start, dhcp_range_end,
+                    slice_bridge_name, patch_port_slice, patch_port_int,
                     dhcp_interface, gateway_interface)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (network_config['slice_id'], network_config['svlan_id'], 
-                network_config['network'],
-                network_config['dhcp_range'][0], network_config['dhcp_range'][1],
-                network_config['slice_bridge_name'], 
-                network_config['patch_ports']['slice_side'],
-                network_config['patch_ports']['int_side'],
-                network_config['dhcp_interface'],
-                network_config['gateway_interface'])
-            ))
-            
-            # 3. Queries para links
-            Logger.debug(f"Preparando queries para {len(topology['links'])} links")
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (network_config['slice_id'], network_config['svlan_id'],
+                 network_config['network'],
+                 network_config['dhcp_range'][0], network_config['dhcp_range'][1],
+                 network_config['slice_bridge_name'],
+                 network_config['patch_ports']['slice_side'],
+                 network_config['patch_ports']['int_side'],
+                 network_config['dhcp_interface'],
+                 network_config['gateway_interface'])
+            )
+
+            # Links (actualizar links reservados)
             for link in topology['links']:
-                queries.append((
-                    """INSERT INTO link 
-                    (id, name, cvlan_id, slice_id) 
-                    VALUES (%s, %s, %s, %s)""",
-                    (link['id'], link['name'], link['cvlan_id'], slice_info['id'])
-                ))
-                Logger.debug(f"Link {link['name']}: ID={link['id']}, CVLAN={link['cvlan_id']}")
-            
-            # 4. Queries para VMs
-            Logger.debug(f"Preparando queries para {len(topology['vms'])} VMs")
+                cursor.execute(
+                    """UPDATE link
+                       SET name     = %s,
+                           cvlan_id = %s,
+                           slice_id = %s
+                       WHERE id = %s""",
+                    (link['name'], link['cvlan_id'], slice_id, link['id'])
+                )
+                Logger.debug(f"Link {link['name']} actualizado: ID={link['id']}, CVLAN={link['cvlan_id']}")
+
+            # VMs (actualizar VMs reservadas)
             for vm in topology['vms']:
-                queries.append((
-                    """INSERT INTO virtual_machine 
-                    (id, name, image, flavor, slice, physical_server, 
-                        status, vnc_port, vnc_display, qemu_pid)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (vm['id'], vm['name'], vm['image_id'], vm['flavor_id'], 
-                    slice_info['id'], vm['physical_server']['id'], 
-                    vm['status'], 5900 + vm['vnc_display'], 
-                    vm['vnc_display'], vm.get('qemu_pid'))
-                ))
-                Logger.debug(
-                    f"VM con nombre '{vm['name']}': ID={vm['id']}, "
-                    f"Worker={vm['physical_server']['name']}, "
-                    f"VNC display={vm['vnc_display']}"
+                cursor.execute(
+                    """UPDATE virtual_machine
+                       SET name     = %s,
+                           image    = %s,
+                           flavor   = %s,
+                           status   = %s,
+                           qemu_pid = %s
+                       WHERE id = %s""",
+                    (vm['name'], vm['image_id'], vm['flavor_id'],
+                     vm['status'], vm.get('qemu_pid'), vm['id'])
                 )
-            
-            # 5. Queries para interfaces
-            Logger.debug(f"Preparando queries para {len(topology['interfaces'])} interfaces")
+                Logger.debug(
+                    f"VM '{vm['name']}' actualizada: ID={vm['id']}, "
+                    f"Worker={vm['physical_server']['name']}"
+                )
+
+            # Interfaces (actualizar interfaces reservadas)
             for iface in topology['interfaces']:
-                queries.append((
-                    """INSERT INTO interface 
-                    (id, name, mac, ip, vm, link, external_access, tap_name)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (iface['id'], iface['name'], iface['mac_address'],
-                    None,  # IP se agrega después si existe
-                    iface['vm_id'], iface['link_id'], 
-                    iface.get('external_access', False),
-                    iface['tap_name'])
-                ))
-                Logger.debug(
-                    f"Interface con nombre '{iface['name']}': ID={iface['id']}, "
-                    f"VM-ID={iface['vm_id']}, TAP={iface['tap_name']}"
+                cursor.execute(
+                    """UPDATE interface
+                       SET name            = %s,
+                           mac             = %s,
+                           ip              = %s,
+                           external_access = %s,
+                           tap_name        = %s
+                       WHERE id = %s""",
+                    (iface['name'], iface['mac_address'],
+                     iface.get('ip'),
+                     iface.get('external_access', False),
+                     iface['tap_name'], iface['id'])
                 )
-            
-            # Ejecutar transacción
-            Logger.debug(f"Ejecutando {len(queries)} queries en transacción")
-            success = self.db.execute_transaction(queries)
-            
-            if success:
-                Logger.success("Slice guardado exitosamente en la base de datos")
-            return success
-                
+                Logger.debug(
+                    f"Interface '{iface['name']}' actualizada: ID={iface['id']}, "
+                    f"VM-ID={iface['vm_id']}"
+                )
+
+            # Crear entrada en tabla property
+            cursor.execute(
+                """INSERT INTO property (user, slice)
+                   VALUES (%s, %s)""",
+                (user_id, slice_id)
+            )
+
+            # Confirmar transacción
+            conn.commit()
+            Logger.success("Slice guardado exitosamente en la base de datos con transacción")
+            return True
+
         except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                    Logger.warning("Transacción revertida debido a error")
+                except:
+                    pass
             Logger.error(f"Error guardando slice: {str(e)}")
             Logger.debug(f"Traceback: {traceback.format_exc()}")
             raise Exception(f"Error guardando slice desplegado: {str(e)}")
+        finally:
+
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
 
 
 # ===================== API ENDPOINTS - SLICE =====================
@@ -1864,12 +2057,12 @@ Notas:
 @app.route('/deploy-slice', methods=['POST'])
 def deploy_slice():
     """
-    Endpoint para desplegar un nuevo slice.
+    Endpoint para desplegar un nuevo slice (con protección contra race conditions :D ).
 
     Request body:
     {
         "slice_info": {
-            "name": str, 
+            "name": str,
             "description": str,
             "user_id": int,
             "sketch_id": int
@@ -2080,10 +2273,10 @@ def deploy_slice():
         }
 
         # 5. Procesar solicitud y desplegar
-        Logger.subsection("Procesando configuración...")
+        Logger.subsection("Procesando configuración con transacción...")
         processor = SliceProcessor()
         try:
-            processed_config = processor.process_request(deployment_config)
+            processed_config = processor.process_request_with_transaction(deployment_config)
         except Exception as e:
             Logger.error(f"Error procesando request: {str(e)}")
             return jsonify({
@@ -2112,7 +2305,13 @@ def deploy_slice():
             operation_id = queue_response.get("operationId")
             Logger.success(f"Solicitud de despliegue encolada. ID de operación: {operation_id}")
 
+
         except Exception as e:
+            # En caso de error, intentar liberar los recursos reservados
+            try:
+                cleanup_reserved_resources(processed_config['slice_info']['id'])
+            except:
+                Logger.warning("No se pudieron liberar los recursos reservados")
             Logger.error(f"Error encolando solicitud: {str(e)}")
             return jsonify({
                 "status": "error",
@@ -2280,15 +2479,16 @@ def operation_callback():
                     "details": "No se proporcionaron datos del slice desplegado"
                 }), 400
 
-            # Procesar y guardar datos del slice desplegado
-            return process_deploy_slice_success(result, user_id)
+            # Procesar y guardar datos del slice desplegado con transacción
+            return process_deploy_slice_success_with_transaction(result, user_id)
 
         elif operation_type == "DEPLOY_SLICE" and status == "FAILED":
             # Procesar fallo de despliegue
             error_message = request_data.get('error', "Error desconocido")
-            return process_deploy_slice_failure(operation_id, error_message, user_id)
+            return process_deploy_slice_failure_with_cleanup(operation_id, erfror_message, user_id,
+                                                             request_data.get('payload', {}))
 
-        # Para otros tipos de operación, implementar según sea necesario
+        # Para otros tipos de operación, implementar según sea necesario...
         # Por ahora solo manejamos DEPLOY_SLICE
 
         return jsonify({
@@ -2307,9 +2507,9 @@ def operation_callback():
         }), 500
 
 
-def process_deploy_slice_success(deployed_data, user_id):
+def process_deploy_slice_success_with_transaction(deployed_data, user_id):
     """
-    Procesa un despliegue exitoso de slice y guarda los datos en la BD.
+    Procesa un despliegue exitoso de slice y actualiza los datos en la BD con transacción.
 
     Args:
         deployed_data (dict): Datos del slice desplegado
@@ -2318,8 +2518,10 @@ def process_deploy_slice_success(deployed_data, user_id):
     Returns:
         Response: Mensaje de éxito/error
     """
+    conn = None
+    cursor = None
     try:
-        Logger.section("PROCESANDO DESPLIEGUE EXITOSO")
+        Logger.section("PROCESANDO DESPLIEGUE EXITOSO CON TRANSACCIÓN")
         Logger.debug(f"Datos recibidos: {json.dumps(deployed_data, indent=2)}")
 
         # Verificar datos
@@ -2328,25 +2530,142 @@ def process_deploy_slice_success(deployed_data, user_id):
 
         # Extraer configuración
         deployed_config = deployed_data.get('content')
-
-        # 1. Guardar slice
-        processor = SliceProcessor()
-        if not processor.save_deployed_slice(deployed_config):
-            raise Exception("Error guardando la slice")
-
         slice_id = deployed_config['slice_info']['id']
+        network_config = deployed_config['network_config']
 
-        # 2. Crear entrada en tabla property
-        property_query = """
-                         INSERT INTO property (user, slice)
-                         VALUES (%s, %s) \
-                         """
-        db.execute_transaction([
-            (property_query, (user_id, slice_id))
-        ])
-        Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
+        # Iniciar transacción
+        conn, cursor = db.start_transaction()
 
-        # 3. Actualizar recursos usados
+        # Bloquear slice para actualización
+        cursor.execute("SELECT id FROM slice WHERE id = %s FOR UPDATE", (slice_id,))
+        result = cursor.fetchall()  # Consumir TODOS los resultados
+        if not result:
+            Logger.warning(f"Slice ID-{slice_id} no encontrada, puede haber sido limpiada")
+            conn.rollback()
+            return jsonify({
+                "status": "error",
+                "message": "Slice no encontrada",
+                "details": f"No se encontró la slice ID-{slice_id} en la base de datos"
+            }), 404
+
+        # Actualizar slice existente
+        cursor.execute(
+            """UPDATE slice
+               SET status      = %s,
+                   name        = %s,
+                   description = %s
+               WHERE id = %s""",
+            (
+                deployed_config['slice_info']['status'],
+                deployed_config['slice_info']['name'],
+                deployed_config['slice_info'].get('description', ''),
+                slice_id
+            )
+        )
+
+        # Verificar si existe entrada en slice_network
+        cursor.execute(
+            """SELECT slice_id
+               FROM slice_network
+               WHERE slice_id = %s""",
+            (slice_id,)
+        )
+        slice_network_exists = cursor.fetchall()  # Consumir resultados
+
+        # Crear o actualizar entrada en slice_network
+        if not slice_network_exists:
+            Logger.debug(f"Creando entrada en slice_network para Slice ID-{slice_id}")
+            cursor.execute(
+                """INSERT INTO slice_network
+                   (slice_id, svlan_id, network, dhcp_range_start, dhcp_range_end,
+                    slice_bridge_name, patch_port_slice, patch_port_int,
+                    dhcp_interface, gateway_interface)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    network_config['slice_id'],
+                    network_config['svlan_id'],
+                    network_config['network'],
+                    network_config['dhcp_range'][0],
+                    network_config['dhcp_range'][1],
+                    network_config['slice_bridge_name'],
+                    network_config['patch_ports']['slice_side'],
+                    network_config['patch_ports']['int_side'],
+                    network_config['dhcp_interface'],
+                    network_config['gateway_interface']
+                )
+            )
+        else:
+            Logger.debug(f"Actualizando entrada en slice_network para Slice ID-{slice_id}")
+            cursor.execute(
+                """UPDATE slice_network
+                   SET svlan_id          = %s,
+                       network           = %s,
+                       dhcp_range_start  = %s,
+                       dhcp_range_end    = %s,
+                       slice_bridge_name = %s,
+                       patch_port_slice  = %s,
+                       patch_port_int    = %s,
+                       dhcp_interface    = %s,
+                       gateway_interface = %s
+                   WHERE slice_id = %s""",
+                (
+                    network_config['svlan_id'],
+                    network_config['network'],
+                    network_config['dhcp_range'][0],
+                    network_config['dhcp_range'][1],
+                    network_config['slice_bridge_name'],
+                    network_config['patch_ports']['slice_side'],
+                    network_config['patch_ports']['int_side'],
+                    network_config['dhcp_interface'],
+                    network_config['gateway_interface'],
+                    slice_id
+                )
+            )
+
+        Logger.debug(f"Información de slice_network actualizada para Slice ID-{slice_id}")
+
+        # Actualizar VMs
+        for vm in deployed_config['topology_info']['vms']:
+            cursor.execute(
+                """UPDATE virtual_machine
+                   SET status   = %s,
+                       qemu_pid = %s,
+                       image    = %s,
+                       flavor   = %s
+                   WHERE id = %s""",
+                (vm['status'], vm.get('qemu_pid'), vm['image_id'], vm['flavor_id'], vm['id'])
+            )
+            Logger.debug(f"VM ID-{vm['id']} actualizada")
+
+        # Verificar si la entrada en property ya existe
+        cursor.execute(
+            """SELECT 1
+               FROM property
+               WHERE user = %s
+                 AND slice = %s""",
+            (user_id, slice_id)
+        )
+        property_exists = cursor.fetchall()  # Importante: consumir resultados
+
+        # Crear entrada en property si no existe
+        if not property_exists:
+            try:
+                cursor.execute(
+                    """INSERT INTO property (user, slice)
+                       VALUES (%s, %s)""",
+                    (user_id, slice_id)
+                )
+                Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
+            except mysql.connector.errors.IntegrityError as e:
+                # Si hay error de duplicado, ignorarlo (ya existe)
+                if e.errno == 1062:  # Duplicate entry error
+                    Logger.debug(f"Entrada ya existente en property: User ID-{user_id}, Slice ID-{slice_id}")
+                else:
+                    raise
+        else:
+            Logger.debug(f"Entrada existente en property: User ID-{user_id}, Slice ID-{slice_id}")
+
+        # Actualizar recursos usados
         Logger.debug("Actualizando recursos usados del usuario")
 
         # Calcular recursos utilizados
@@ -2364,25 +2683,45 @@ def process_deploy_slice_success(deployed_data, user_id):
             required_ram += flavor['ram']
             required_disk += float(flavor['disk'])
 
-        update_resources_query = """
-                                 UPDATE resource
-                                 SET used_vcpus  = used_vcpus + %s,
-                                     used_ram    = used_ram + %s,
-                                     used_disk   = used_disk + %s,
-                                     used_slices = used_slices + 1
-                                 WHERE user = %s \
-                                 """
+        # Bloquear tabla resource para actualización
+        cursor.execute(
+            """SELECT user
+               FROM resource
+               WHERE user = %s
+                   FOR UPDATE""",
+            (user_id,)
+        )
+        resource_exists = cursor.fetchall()  # Consumir resultados
 
-        db.execute_transaction([
-            (update_resources_query, (required_vcpus, required_ram, required_disk, user_id))
-        ])
+        if not resource_exists:
+            # Si no existe recurso para el usuario, crear uno
+            Logger.warning(f"No se encontró registro de recursos para usuario {user_id}")
+            cursor.execute(
+                """INSERT INTO resource (user, vcpus, ram, disk, slices,
+                                         used_vcpus, used_ram, used_disk, used_slices)
+                   VALUES (%s, 100, 2048, 50, 10, %s, %s, %s, 1)""",
+                (user_id, required_vcpus, required_ram, required_disk)
+            )
+        else:
+            # Actualizar recursos
+            cursor.execute(
+                """UPDATE resource
+                   SET used_vcpus  = used_vcpus + %s,
+                       used_ram    = used_ram + %s,
+                       used_disk   = used_disk + %s,
+                       used_slices = used_slices + 1
+                   WHERE user = %s""",
+                (required_vcpus, required_ram, required_disk, user_id)
+            )
 
         Logger.debug(
             f"Recursos actualizados - vCPUs: +{required_vcpus}, RAM: +{required_ram}MB, Disk: +{required_disk}GB")
-        Logger.success(f"Recursos del usuario {user_id} actualizados exitosamente")
 
-        # 4. Respuesta final
+        # Confirmar transacción
+        conn.commit()
         Logger.success(f"Despliegue de slice {slice_id} completado y guardado exitosamente")
+
+        # Respuesta final
         return jsonify({
             "status": "success",
             "message": f"Slice desplegado exitosamente",
@@ -2393,6 +2732,12 @@ def process_deploy_slice_success(deployed_data, user_id):
         }), 200
 
     except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+                Logger.warning("Transacción revertida debido a error")
+            except:
+                pass
         Logger.error(f"Error procesando despliegue exitoso: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
         return jsonify({
@@ -2401,8 +2746,14 @@ def process_deploy_slice_success(deployed_data, user_id):
             "details": str(e)
         }), 500
 
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
-def process_deploy_slice_failure(operation_id, error_message, user_id):
+
+def process_deploy_slice_failure_with_cleanup(operation_id, error_message, user_id, payload):
     """
     Procesa un fallo en el despliegue de slice.
 
@@ -2410,6 +2761,7 @@ def process_deploy_slice_failure(operation_id, error_message, user_id):
         operation_id (int): ID de la operación
         error_message (str): Mensaje de error
         user_id (int): ID del usuario
+        payload (dict): Datos de la solicitud original
 
     Returns:
         Response: Mensaje de error
@@ -2418,8 +2770,19 @@ def process_deploy_slice_failure(operation_id, error_message, user_id):
         Logger.section("PROCESANDO FALLO DE DESPLIEGUE")
         Logger.error(f"Fallo en despliegue, operación ID-{operation_id}: {error_message}")
 
-        # Aquí podríamos notificar al usuario, registrar el error en logs, etc.
-        # Por ahora solo retornamos un mensaje informativo
+        # Intentar extraer ID de slice del payload
+        slice_id = None
+        try:
+            if payload and 'slice_info' in payload:
+                slice_id = payload['slice_info'].get('id')
+        except:
+            Logger.warning("No se pudo obtener ID de slice del payload")
+
+        # Si tenemos ID de slice, limpiar recursos reservados
+        if slice_id:
+            Logger.warning(f"Limpiando recursos reservados para slice ID-{slice_id}")
+            cleanup_reserved_resources(slice_id)
+
 
         return jsonify({
             "status": "success",
@@ -2439,6 +2802,198 @@ def process_deploy_slice_failure(operation_id, error_message, user_id):
             "message": "Error procesando fallo de despliegue",
             "details": str(e)
         }), 500
+
+
+def cleanup_reserved_resources(slice_id):
+    """
+    Limpia recursos reservados en caso de error durante el despliegue.
+
+    Args:
+        slice_id (int): ID de la slice a limpiar
+    """
+    try:
+        Logger.warning(f"Limpiando recursos reservados para slice ID-{slice_id}")
+
+        # Iniciar transacción
+        conn, cursor = db.start_transaction()
+
+        # Bloquear tablas para limpieza
+        cursor.execute("SELECT id FROM slice WHERE id = %s FOR UPDATE", (slice_id,))
+
+        # Eliminar interfaces
+        cursor.execute(
+            """DELETE
+               FROM interface
+               WHERE vm IN (SELECT id FROM virtual_machine WHERE slice = %s)""",
+            (slice_id,)
+        )
+
+        # Eliminar links
+        cursor.execute("DELETE FROM link WHERE slice_id = %s", (slice_id,))
+
+        # Eliminar VMs
+        cursor.execute("DELETE FROM virtual_machine WHERE slice = %s", (slice_id,))
+
+        # Eliminar slice_network
+        cursor.execute("DELETE FROM slice_network WHERE slice_id = %s", (slice_id,))
+
+        # Eliminar slice
+        cursor.execute("DELETE FROM slice WHERE id = %s", (slice_id,))
+
+        # Confirmar transacción
+        conn.commit()
+        Logger.success(f"Recursos reservados para slice ID-{slice_id} limpiados exitosamente")
+
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        Logger.error(f"Error limpiando recursos reservados: {str(e)}")
+
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn:
+            conn.close()
+
+def cleanup_orphaned_reservations():
+    """
+    Limpia reservas temporales que llevan más de 1 hora sin completar el despliegue.
+    Este método debe ejecutarse periódicamente mediante un cron job.
+    """
+    try:
+        Logger.section("LIMPIEZA DE RESERVAS TEMPORALES")
+
+        # Iniciar transacción
+        conn, cursor = db.start_transaction()
+
+        # 1. Identificar slices temporales antiguas
+        cursor.execute(
+            """SELECT id
+               FROM slice
+               WHERE status = 'reserving'
+                 AND created_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                   FOR UPDATE"""
+        )
+        orphaned_slices = [row['id'] for row in cursor.fetchall()]
+
+        if not orphaned_slices:
+            Logger.info("No se encontraron reservas huérfanas")
+            conn.commit()
+            return
+
+        Logger.warning(f"Se encontraron {len(orphaned_slices)} reservas huérfanas: {orphaned_slices}")
+
+        # 2. Limpiar recursos para cada slice huérfana
+        for slice_id in orphaned_slices:
+            # Eliminar interfaces
+            cursor.execute(
+                """DELETE
+                   FROM interface
+                   WHERE vm IN (SELECT id FROM virtual_machine WHERE slice = %s)""",
+                (slice_id,)
+            )
+
+            # Eliminar VMs y liberar displays VNC
+            cursor.execute(
+                """DELETE
+                   FROM worker_vnc_reservation
+                   WHERE vm_id IN (SELECT id FROM virtual_machine WHERE slice = %s)""",
+                (slice_id,)
+            )
+            cursor.execute("DELETE FROM virtual_machine WHERE slice = %s", (slice_id,))
+
+            # Eliminar links
+            cursor.execute("DELETE FROM link WHERE slice_id = %s", (slice_id,))
+
+            # Eliminar slice_network
+            cursor.execute("DELETE FROM slice_network WHERE slice_id = %s", (slice_id,))
+
+            # Eliminar slice
+            cursor.execute("DELETE FROM slice WHERE id = %s", (slice_id,))
+
+            Logger.success(f"Recursos de slice huérfana ID-{slice_id} liberados")
+
+        # 3. Limpiar reservas VNC huérfanas
+        cursor.execute(
+            """DELETE
+               FROM worker_vnc_reservation
+               WHERE status = 'reserved'
+                 AND reserved_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)"""
+        )
+        vnc_cleaned = cursor.rowcount
+        if vnc_cleaned > 0:
+            Logger.success(f"Se limpiaron {vnc_cleaned} reservas VNC huérfanas")
+
+        # Confirmar transacción
+        conn.commit()
+        Logger.success("Limpieza de reservas huérfanas completada")
+
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        Logger.error(f"Error en limpieza de reservas huérfanas: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn:
+            conn.close()
+
+
+def setup_cleanup_scheduler():
+    """
+    Configura scheduler para limpiar reservas huérfanas periódicamente.
+    """
+    import schedule
+    import time
+    import threading
+
+    def run_scheduler():
+        # Ejecutar limpieza cada hora
+        schedule.every(1).hour.do(cleanup_orphaned_reservations)
+
+        # Ejecutar inmediatamente la primera vez
+        cleanup_orphaned_reservations()
+
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # Verificar cada minuto
+
+    # Iniciar scheduler en thread separado
+    scheduler_thread = threading.Thread(target=run_scheduler)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    Logger.info("Scheduler de limpieza iniciado")
+
+
+def start_transaction_with_timeout(self, timeout_seconds=30):
+    """
+    Inicia una transacción manual con timeout y retorna la conexión y cursor.
+
+    Args:
+        timeout_seconds (int): Segundos máximos para timeout de transacción
+
+    Returns:
+        tuple: (conexión, cursor) para usar en la transacción
+    """
+    try:
+        conn = self.get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Configurar timeout
+        cursor.execute(f"SET SESSION innodb_lock_wait_timeout = {timeout_seconds}")
+
+        return conn, cursor
+    except Exception as e:
+        Logger.error(f"Error iniciando transacción: {str(e)}")
+        raise
 
 
 @app.route('/poll-operation/<operation_id>', methods=['GET'])
@@ -2580,7 +3135,7 @@ def get_operation_status(operation_id):
         # Consultar estado
         response = requests.get(
             f"http://{queue_manager['ipAddr']}:{queue_manager['port']}/api/queue/operations/{operation_id}",
-            timeout=30
+            timeout=45
         )
 
         # Procesar respuesta
@@ -2751,7 +3306,7 @@ def pause_vm_endpoint(vm_id: str):
         Response: Mensaje de éxito/error y detalles
             200: VM pausada exitosamente
             400: ID de VM inválido
-            404: VM no encontrada o no ejecutándose 
+            404: VM no encontrada o no ejecutándose
             500: Error interno
             503: Error de comunicación con servidor
     """
@@ -2768,7 +3323,7 @@ def pause_vm_endpoint(vm_id: str):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -2778,17 +3333,17 @@ def pause_vm_endpoint(vm_id: str):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -2797,7 +3352,7 @@ def pause_vm_endpoint(vm_id: str):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -2839,7 +3394,7 @@ def pause_vm_endpoint(vm_id: str):
                    WHERE id = %s AND status = 'running'""",
                 (vm_id,)
             )
-            
+
             if not vm_exists:
                 Logger.warning(f"VM ID-{vm_id} no encontrada o no está en ejecución")
                 return jsonify({
@@ -2859,7 +3414,7 @@ def pause_vm_endpoint(vm_id: str):
         vm = vm_info[0]
         Logger.info(f"VM ID-{vm['id']} con nombre '{vm['name']}' encontrada en Worker ID-{vm['worker_id']} con nombre {vm['worker_name']}")
 
-        
+
         # 2. Preparar datos para Slice Controller
         Logger.debug("Preparando datos para servidor de despliegue")
         pause_data = {
@@ -2881,12 +3436,12 @@ def pause_vm_endpoint(vm_id: str):
             },
             "slice_id": vm['slice_id']
         }
-        
+
         # 3. Enviar solicitud a Slice Controller
         Logger.info("Enviando solicitud de pausa al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
         if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible") 
+            raise Exception("Servicio slice-controller no disponible")
 
         response = requests.post(
             f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/pause-vm/{vm_id}",
@@ -2898,7 +3453,7 @@ def pause_vm_endpoint(vm_id: str):
         # 4. Procesar respuesta
         if response.status_code == 200:
             Logger.info(f"VM ID-{vm_id} con nombre '{vm['name']}' pausada exitosamente en servidor")
-            
+
             # 5. Actualizar estado en BD
             Logger.debug("Actualizando estado en base de datos")
             update_query = """
@@ -2981,7 +3536,7 @@ def resume_vm_endpoint(vm_id: str):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -2991,17 +3546,17 @@ def resume_vm_endpoint(vm_id: str):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -3010,7 +3565,7 @@ def resume_vm_endpoint(vm_id: str):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -3044,7 +3599,7 @@ def resume_vm_endpoint(vm_id: str):
             WHERE vm.id = %s 
             AND vm.status = 'paused'
             AND p.user = %s"""
-        
+
         vm_info = db.execute_query(access_query, (vm_id, user_id))
 
         if not vm_info:
@@ -3054,7 +3609,7 @@ def resume_vm_endpoint(vm_id: str):
                    WHERE id = %s AND status = 'paused'""",
                 (vm_id,)
             )
-            
+
             if not vm_exists:
                 Logger.warning(f"VM ID-{vm_id} no encontrada o no está pausada")
                 return jsonify({
@@ -3093,7 +3648,7 @@ def resume_vm_endpoint(vm_id: str):
                ORDER BY external_access DESC""",
             (vm_id,)
         )
-        
+
         # 4. Preparar datos para Slice Controller
         Logger.debug("Preparando datos para servidor de despliegue")
         resume_data = {
@@ -3136,12 +3691,12 @@ def resume_vm_endpoint(vm_id: str):
             },
             "slice_id": vm['slice_id']
         }
-        
+
         # 5. Enviar solicitud a Slice Controller
         Logger.info("Enviando solicitud de reanudación al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
         if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible") 
+            raise Exception("Servicio slice-controller no disponible")
 
         response = requests.post(
             f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/resume-vm/{vm_id}",
@@ -3154,7 +3709,7 @@ def resume_vm_endpoint(vm_id: str):
         if response.status_code == 200:
             response_data = response.json()
             vm_data = response_data['content']
-            
+
             # 7. Actualizar estado en BD
             Logger.debug("Actualizando estado en base de datos")
             update_query = """
@@ -3166,7 +3721,7 @@ def resume_vm_endpoint(vm_id: str):
                 WHERE id = %s
             """
             db.execute_transaction([(
-                update_query, 
+                update_query,
                 (
                     vm_data.get('qemu_pid'),
                     vm_data.get('vnc_display'),
@@ -3214,7 +3769,7 @@ def resume_vm_endpoint(vm_id: str):
         Logger.error(f"Error reanudando VM: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
         return jsonify({
-            "status": "error", 
+            "status": "error",
             "message": "Error interno al procesar la solicitud de reanudación",
             "details": str(e)
         }), 500
@@ -3248,7 +3803,7 @@ def restart_vm_endpoint(vm_id: str):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -3258,17 +3813,17 @@ def restart_vm_endpoint(vm_id: str):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -3277,7 +3832,7 @@ def restart_vm_endpoint(vm_id: str):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -3321,7 +3876,7 @@ def restart_vm_endpoint(vm_id: str):
                    WHERE id = %s AND status = 'running'""",
                 (vm_id,)
             )
-            
+
             if not vm_exists:
                 Logger.warning(f"VM ID-{vm_id} no encontrada o no está en ejecución")
                 return jsonify({
@@ -3387,7 +3942,7 @@ def restart_vm_endpoint(vm_id: str):
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
         if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible") 
+            raise Exception("Servicio slice-controller no disponible")
 
         response = requests.post(
             f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-vm/{vm_id}",
@@ -3400,7 +3955,7 @@ def restart_vm_endpoint(vm_id: str):
         if response.status_code == 200:
             response_data = response.json()
             vm_data = response_data.get('content', {})
-            
+
             # 5. Actualizar estado en BD
             Logger.debug("Actualizando estado en base de datos")
             update_query = """
@@ -3412,7 +3967,7 @@ def restart_vm_endpoint(vm_id: str):
                 WHERE id = %s
             """
             db.execute_transaction([(
-                update_query, 
+                update_query,
                 (
                     vm_data.get('qemu_pid'),
                     vm_data.get('vnc_display'),
@@ -3494,7 +4049,7 @@ def restart_slice_endpoint(slice_id: str):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -3504,17 +4059,17 @@ def restart_slice_endpoint(slice_id: str):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -3523,7 +4078,7 @@ def restart_slice_endpoint(slice_id: str):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -3556,7 +4111,7 @@ def restart_slice_endpoint(slice_id: str):
                 "SELECT id FROM slice WHERE id = %s",
                 (slice_id,)
             )
-            
+
             if slice_exists:
                 Logger.warning(f"Usuario {user_id} no tiene acceso al slice {slice_id}")
                 return jsonify({
@@ -3596,7 +4151,7 @@ def restart_slice_endpoint(slice_id: str):
             WHERE s.id = %s AND vm.status = 'running'
         """
         result = db.execute_query(query, (slice_id,))
-        
+
         if not result:
             Logger.warning(f"Slice {slice_id} no encontrado o sin VMs en ejecución")
             return jsonify({
@@ -3696,7 +4251,7 @@ def restart_slice_endpoint(slice_id: str):
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
         if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible") 
+            raise Exception("Servicio slice-controller no disponible")
 
         response = requests.post(
             f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-slice/{slice_id}",
@@ -3709,7 +4264,7 @@ def restart_slice_endpoint(slice_id: str):
         if response.status_code == 200:
             Logger.info("Reinicio exitoso, actualizando base de datos")
             response_data = response.json()
-            
+
             # Preparar queries de actualización
             update_vm_query = """
                 UPDATE virtual_machine 
@@ -3724,10 +4279,10 @@ def restart_slice_endpoint(slice_id: str):
                 SET status = 'running'
                 WHERE id = %s
             """
-            
+
             # Construir transacción
             transactions = [(update_slice_query, (slice_id,))]
-            
+
             # Agregar actualizaciones de VMs
             for vm_data in response_data.get('content', {}).get('vms', []):
                 vnc_display = vm_data.get('vnc_display')
@@ -3810,7 +4365,7 @@ def stop_slice_endpoint(slice_id: str):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -3820,17 +4375,17 @@ def stop_slice_endpoint(slice_id: str):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -3839,7 +4394,7 @@ def stop_slice_endpoint(slice_id: str):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -3872,7 +4427,7 @@ def stop_slice_endpoint(slice_id: str):
                 "SELECT id FROM slice WHERE id = %s",
                 (slice_id,)
             )
-            
+
             if slice_exists:
                 Logger.warning(f"Usuario {user_id} no tiene acceso al slice {slice_id}")
                 return jsonify({
@@ -3887,7 +4442,7 @@ def stop_slice_endpoint(slice_id: str):
                     "message": "El slice solicitado no existe",
                     "details": f"No se encontró el slice con ID {slice_id}"
                 }), 404
-            
+
         # 1. Obtener información de la slice y sus VMs
         Logger.debug("Consultando información de la slice en base de datos")
         query = """
@@ -3907,9 +4462,9 @@ def stop_slice_endpoint(slice_id: str):
             LEFT JOIN interface i ON i.vm = vm.id
             WHERE s.id = %s AND vm.status = 'running'
         """
-        
+
         result = db.execute_query(query, (slice_id,))
-        
+
         if not result:
             Logger.warning(f"Slice ID-{slice_id} no encontrado o sin VMs en ejecución")
             return jsonify({
@@ -3917,7 +4472,7 @@ def stop_slice_endpoint(slice_id: str):
                 "message": "La slice no está disponible para ser detenida",
                 "details": "No se encontró la slice o no tiene máquinas virtuales en ejecución"
             }), 404
-        
+
 
         slice_network_info = db.execute_query(
             """SELECT s.*, sn.* 
@@ -3964,7 +4519,7 @@ def stop_slice_endpoint(slice_id: str):
             if row['interface_id']:
                 if row['vm_id'] not in interfaces_by_vm:
                     interfaces_by_vm[row['vm_id']] = []
-                    
+
                 interface_data = {
                     "id": row['interface_id'],
                     "name": row['interface_name'],
@@ -3974,7 +4529,7 @@ def stop_slice_endpoint(slice_id: str):
                     "external_access": row['external_access']
                 }
                 interfaces_by_vm[row['vm_id']].append(interface_data)
-                
+
                 # Agregar a la lista general de interfaces
                 stop_data['interfaces'].append(interface_data)
 
@@ -4004,12 +4559,12 @@ def stop_slice_endpoint(slice_id: str):
                         "ssh_key_path": row['ssh_key_path']
                     }
                     Logger.debug(f"Worker registrado: {row['worker_name']}")
-                    
+
         # 3. Enviar request a Slice Controller
         Logger.info("Enviando solicitud de detención al servidor de despliegue")
         slice_controller = get_service_instance('slice-controller')
         if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible") 
+            raise Exception("Servicio slice-controller no disponible")
 
         response = requests.post(
             f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/stop-slice/{slice_id}",
@@ -4021,7 +4576,7 @@ def stop_slice_endpoint(slice_id: str):
         # 4. Procesar respuesta y actualizar BD
         if response.status_code == 200:
             Logger.info("Detención exitosa, actualizando base de datos")
-            
+
             # Preparar queries de actualización
             update_vm_query = """
                 UPDATE virtual_machine 
@@ -4031,20 +4586,20 @@ def stop_slice_endpoint(slice_id: str):
                     vnc_display = NULL
                 WHERE id = %s
             """
-            
+
             update_slice_query = """
                 UPDATE slice 
                 SET status = 'stopped'
                 WHERE id = %s
             """
-            
+
             # Construir transacción
             transactions = [(update_slice_query, (slice_id,))]
-            
+
             # Agregar actualizaciones de VMs
             for vm in stop_data['vms']:
                 transactions.append((
-                    update_vm_query, 
+                    update_vm_query,
                     (vm['id'],)
                 ))
 
@@ -4145,7 +4700,7 @@ def get_slice(slice_id):
     try:
         Logger.major_section(f"API: GET SLICE ID-{slice_id}")
         slice_id = int(slice_id)
-        
+
         # 0. Validar al usuario y su relación con la slice
         auth_token = request.headers.get('Authorization')
         if not auth_token:
@@ -4155,7 +4710,7 @@ def get_slice(slice_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -4165,17 +4720,17 @@ def get_slice(slice_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -4184,7 +4739,7 @@ def get_slice(slice_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -4217,7 +4772,7 @@ def get_slice(slice_id):
                 "SELECT id FROM slice WHERE id = %s",
                 (slice_id,)
             )
-            
+
             if slice_exists:
                 Logger.warning(f"Usuario {user_id} no tiene acceso al slice {slice_id}")
                 return jsonify({
@@ -4309,7 +4864,7 @@ def get_slice(slice_id):
         Logger.debug("Estructurando respuesta")
         slice_data = {
             "slice_info": {
-                "id": slice_id, 
+                "id": slice_id,
                 "name": slice_info[0]['name'],
                 "description": slice_info[0]['description'],
                 "status": slice_info[0]['status'],
@@ -4369,7 +4924,7 @@ def get_slice(slice_id):
                 } for iface in interfaces]
             }
         }
-        
+
         Logger.success(f"Información del la Slice ID-{slice_id} obtenida exitosamente")
         return jsonify({
             "status": "success",
@@ -4397,10 +4952,10 @@ def get_slice(slice_id):
 def get_vm(vm_id):
     """
     Obtiene información detallada de una máquina virtual específica.
-    
+
     Args:
         vm_id (str): ID de la VM a consultar
-        
+
 
     Returns:
         Response: Información completa de la VM incluyendo:
@@ -4410,7 +4965,7 @@ def get_vm(vm_id):
             - Worker donde está desplegada
             - Interfaces de red
             - Estado actual y configuración VNC
-            
+
         Códigos de respuesta:
             200: VM encontrada y acceso permitido
             400: ID inválido o falta user_id
@@ -4422,7 +4977,7 @@ def get_vm(vm_id):
         Logger.major_section(f"API: GET VM ID-{vm_id}")
         vm_id = int(vm_id)
 
-        # 1. Validar user_id 
+        # 1. Validar user_id
         auth_token = request.headers.get('Authorization')
         if not auth_token:
             Logger.error("No se proporcionó token de autorización")
@@ -4431,7 +4986,7 @@ def get_vm(vm_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -4441,17 +4996,17 @@ def get_vm(vm_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -4460,7 +5015,7 @@ def get_vm(vm_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -4506,7 +5061,7 @@ def get_vm(vm_id):
                 "SELECT id FROM virtual_machine WHERE id = %s",
                 (vm_id,)
             )
-            
+
             if vm_exists:
                 Logger.warning(f"Usuario {user_id} no tiene acceso a VM {vm_id}")
                 return jsonify({
@@ -4611,9 +5166,9 @@ def get_vm(vm_id):
 def list_slices():
     """
     Obtiene todos los slices a los que tiene acceso un usuario.
-    
+
     Query params:
-        
+
 
     Returns:
         Response: Lista de slices con recursos y estado
@@ -4623,7 +5178,7 @@ def list_slices():
     """
     try:
         Logger.major_section("API: LIST USER SLICES")
-        
+
         # Obtener y validar token
         auth_token = request.headers.get('Authorization')
         if not auth_token:
@@ -4633,7 +5188,7 @@ def list_slices():
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -4643,17 +5198,17 @@ def list_slices():
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -4662,7 +5217,7 @@ def list_slices():
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -4705,7 +5260,7 @@ def list_slices():
                      u.username, u.name, u.lastname
             ORDER BY s.created_at DESC
         """
-        
+
         slices = db.execute_query(query, (user_id,))
         Logger.debug(f"Slices encontrados: {len(slices)}")
 
@@ -4766,26 +5321,26 @@ def get_flavors():
     """
     try:
         Logger.major_section("API: GET FLAVORS")
-        
-        # Obtener user_id 
+
+        # Obtener user_id
         user_id = request.args.get('user_id')
         Logger.debug(f"User ID: {user_id if user_id else 'No proporcionado'}")
-        
+
         # Construir query base
         base_query = """
             SELECT id, name, vcpus, ram, disk, type, state, user
             FROM flavor 
             WHERE state = 'active' 
             AND (user IS NULL"""  # Recursos públicos
-            
+
         # Agregar condición para recursos privados si hay user_id
         if user_id:
             base_query += f" OR user = {user_id})"  # Recursos privados del usuario
         else:
             base_query += ")"  # Solo recursos públicos
-            
+
         base_query += " ORDER BY id"
-        
+
         # Consultar flavors
         Logger.debug("Consultando flavors en base de datos")
         flavors = db.execute_query(base_query)
@@ -4829,26 +5384,26 @@ def get_images():
     """
     try:
         Logger.major_section("API: GET IMAGES")
-        
+
         # Obtener user_id
         user_id = request.args.get('user_id')
         Logger.debug(f"User ID: {user_id if user_id else 'No proporcionado'}")
-        
+
         # Construir query base
         base_query = """
             SELECT id, name, path, type, state, user
             FROM image
             WHERE state = 'active' 
             AND (user IS NULL"""  # Recursos públicos
-            
+
         # Agregar condición para recursos privados si hay user_id
         if user_id:
             base_query += f" OR user = {user_id})"  # Recursos privados del usuario
         else:
             base_query += ")"  # Solo recursos públicos
-            
+
         base_query += " ORDER BY id"
-        
+
         # Consultar imágenes
         Logger.debug("Consultando imágenes en base de datos")
         images = db.execute_query(base_query)
@@ -4883,10 +5438,10 @@ def get_images():
 def get_available_vnc_displays():
     """
     Obtiene los displays VNC disponibles para los workers especificados.
-    
+
     Request body:
         {"worker_ids": [int]} - Lista de IDs de workers
-        
+
     Returns:
         Response: Displays disponibles por worker
             200: Displays obtenidos exitosamente
@@ -4909,7 +5464,7 @@ def get_available_vnc_displays():
         # Obtener displays usados por cada worker
         Logger.debug(f"Procesando {len(worker_ids)} workers")
         displays_by_worker = {}
-        
+
         for worker_id in worker_ids:
             Logger.debug(f"Consultando displays para worker {worker_id}")
             query = """
@@ -4922,12 +5477,12 @@ def get_available_vnc_displays():
             """
             used_displays = db.execute_query(query, (worker_id,))
             Logger.debug(f"Displays en uso: {len(used_displays)}")
-            
+
             # Buscar displays disponibles (rango 1-100)
             used_numbers = {d['vnc_display'] for d in used_displays if d['vnc_display']}
             available = []
             current = 1
-            
+
             while current <= 100:  # Límite de displays 1-100
                 if current not in used_numbers:
                     available.append(current)
@@ -4956,10 +5511,10 @@ def get_available_vnc_displays():
 def generate_vnc_token(vm_id):
     """
     Genera un token JWT para acceso VNC a una VM.
-    
+
     Args:
         vm_id (str): ID de la VM para la cual generar el token
-        
+
     Returns:
         Response: Token JWT y URL de acceso
             200: Token generado exitosamente
@@ -4980,7 +5535,7 @@ def generate_vnc_token(vm_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -4990,17 +5545,17 @@ def generate_vnc_token(vm_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -5009,7 +5564,7 @@ def generate_vnc_token(vm_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -5047,7 +5602,7 @@ def generate_vnc_token(vm_id):
                    WHERE id = %s AND status = 'running'""",
                 (vm_id,)
             )
-            
+
             if not vm_exists:
                 Logger.warning(f"VM ID-{vm_id} no encontrada o no está activa")
                 return jsonify({
@@ -5065,16 +5620,16 @@ def generate_vnc_token(vm_id):
 
         vm = vm_info[0]
         Logger.info(f"VM encontrada: Nombre: {vm['name']}, ID: {vm_id}, Slice-ID: {vm['slice_id']}, Slice-Name: {vm['slice_name']}")
-        
+
         # Generar token JWT
         Logger.debug("Generando token JWT")
         token = vnc_token_manager.generate_token(vm_id)
         Logger.debug("Token generado exitosamente")
-        
+
         # Construir URL de acceso
         vnc_url = f"/vm-vnc/{vm_id}?token={token}"
         Logger.success(f"Token VNC generado para VM ID-{vm_id} con nombre '{vm['name']}'")
-        
+
         return jsonify({
             "status": "success",
             "message": "Token de acceso VNC generado exitosamente para la VM solicitada",
@@ -5087,7 +5642,7 @@ def generate_vnc_token(vm_id):
                 "url": vnc_url
             }
         }), 200
-        
+
     except ValueError:
         Logger.error(f"ID de VM inválido: ID-{vm_id}")
         return jsonify({
@@ -5108,11 +5663,11 @@ def generate_vnc_token(vm_id):
 def vnc_proxy(ws, vm_id):
     """
     WebSocket proxy para conexión VNC a una VM específica.
-    
+
     Args:
         ws: WebSocket connection object
         vm_id (str): ID de la VM a conectar
-        
+
     Notes:
         - Requiere token JWT válido en query params
         - Establece túnel bidireccional entre WebSocket y socket VNC
@@ -5120,7 +5675,7 @@ def vnc_proxy(ws, vm_id):
     """
     try:
         Logger.major_section(f"API: SOCKET VNC CONSOLE VM ID-{vm_id}")
-        
+
         # 1. Verificar token
         Logger.debug("Validando token de acceso")
         token = request.args.get('token')
@@ -5139,7 +5694,7 @@ def vnc_proxy(ws, vm_id):
                WHERE vm.id = %s AND vm.status = 'running'""",
             (vm_id,)
         )
-        
+
         if not vm_info:
             Logger.warning(f"VM ID-{vm_id} no encontrada o no activa")
             ws.send("VM no disponible para conexión VNC")
@@ -5150,11 +5705,11 @@ def vnc_proxy(ws, vm_id):
         vm = vm_info[0]
         worker_ip = vm['data_ip']
         vnc_port = vm['vnc_port']
-        
+
         Logger.info(f"Conectando a VNC en {worker_ip}:{vnc_port}")
         vnc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         vnc_socket.settimeout(10)
-        
+
         try:
             vnc_socket.connect((worker_ip, int(vnc_port)))
             vnc_socket.settimeout(None)
@@ -5163,10 +5718,10 @@ def vnc_proxy(ws, vm_id):
             ws.send(f"Error de conexión: {str(e)}")
             ws.close(1011, "Error de conexión")
             return
-            
+
         Logger.success(f"Conexión VNC establecida con {worker_ip}:{vnc_port}")
         stop_event = threading.Event()
-        
+
         # 4. Definir funciones de proxy
         def ws_to_vnc():
             """Reenvía datos desde WebSocket hacia VNC"""
@@ -5180,7 +5735,7 @@ def vnc_proxy(ws, vm_id):
                 Logger.error(f"Error en ws_to_vnc: {str(e)}")
             finally:
                 stop_event.set()
-                
+
         def vnc_to_ws():
             """Reenvía datos desde VNC hacia WebSocket"""
             try:
@@ -5196,15 +5751,15 @@ def vnc_proxy(ws, vm_id):
                 Logger.error(f"Error en vnc_to_ws: {str(e)}")
             finally:
                 stop_event.set()
-                
+
         # 5. Iniciar threads de proxy
         Logger.debug("Iniciando threads de proxy")
         ws_thread = threading.Thread(target=ws_to_vnc)
         vnc_thread = threading.Thread(target=vnc_to_ws)
-        
+
         ws_thread.daemon = True
         vnc_thread.daemon = True
-        
+
         ws_thread.start()
         vnc_thread.start()
         Logger.success("Proxy VNC iniciado exitosamente")
@@ -5212,14 +5767,14 @@ def vnc_proxy(ws, vm_id):
         # 6. Esperar finalización
         while not stop_event.is_set():
             time.sleep(0.1)
-            
+
         # 7. Cleanup
         try:
             Logger.debug("Cerrando conexión VNC")
             vnc_socket.close()
         except Exception as e:
             Logger.error(f"Error cerrando socket VNC: {str(e)}")
-            
+
     except Exception as e:
         Logger.error(f"Error en proxy VNC: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
@@ -5269,14 +5824,14 @@ def create_sketch():
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-        
+
         # 1. Validar campos requeridos
         required_fields = ['name', 'user_id', 'topology_info']
         for field in required_fields:
             if field not in request_data:
                 Logger.error(f"Campo requerido faltante: {field}")
                 return jsonify({
-                    "status": "error", 
+                    "status": "error",
                     "message": "Faltan campos requeridos",
                     "details": f"El campo '{field}' es requerido"
                 }), 400
@@ -5297,12 +5852,12 @@ def create_sketch():
                 "message": "Descripción de sketch inválida",
                 "details": "La descripción debe tener máximo 1000 caracteres"
             }), 400
-        
+
         # 2. Validar recursos (flavors e images)
         Logger.debug("Validando recursos...")
         topology = request_data['topology_info']
         user_id = request_data['user_id']
-        
+
         # Obtener IDs únicos de flavors e images
         flavor_ids = {str(vm['flavor_id']) for vm in topology.get('vms', [])}
         image_ids = {str(vm['image_id']) for vm in topology.get('vms', [])}
@@ -5313,11 +5868,11 @@ def create_sketch():
             """SELECT id FROM flavor 
                WHERE id IN (%s) 
                AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+               AND (user IS NULL OR user = %s)""" %
             (','.join(flavor_ids) if flavor_ids else 'NULL', user_id)
         )
         valid_flavor_ids = {str(f['id']) for f in valid_flavors}
-        
+
         invalid_flavors = flavor_ids - valid_flavor_ids
         if invalid_flavors:
             Logger.error(f"Flavors inválidos o no accesibles: {invalid_flavors}")
@@ -5327,17 +5882,17 @@ def create_sketch():
                 "details": f"Los siguientes flavors no existen, no están activos o no tienes permiso: {list(invalid_flavors)}"
             }), 400
 
-        # Verificar images - públicas o del usuario  
+        # Verificar images - públicas o del usuario
         Logger.debug(f"Verificando images: {image_ids}")
         valid_images = db.execute_query(
             """SELECT id FROM image 
                WHERE id IN (%s) 
                AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+               AND (user IS NULL OR user = %s)""" %
             (','.join(image_ids) if image_ids else 'NULL', user_id)
         )
         valid_image_ids = {str(i['id']) for i in valid_images}
-        
+
         invalid_images = image_ids - valid_image_ids
         if invalid_images:
             Logger.error(f"Images inválidas o no accesibles: {invalid_images}")
@@ -5359,7 +5914,7 @@ def create_sketch():
             INSERT INTO sketch (user, structure, created_at, updated_at)
             VALUES (%s, %s, NOW(), NOW())
         """
-        
+
         db.execute_transaction([
             (query, (request_data['user_id'], json.dumps(structure)))
         ])
@@ -5413,7 +5968,7 @@ def get_sketch(sketch_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -5423,17 +5978,17 @@ def get_sketch(sketch_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -5442,7 +5997,7 @@ def get_sketch(sketch_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -5472,10 +6027,10 @@ def get_sketch(sketch_id):
         if not result:
             # Verificar si el sketch existe
             exists = db.execute_query(
-                "SELECT id FROM sketch WHERE id = %s", 
+                "SELECT id FROM sketch WHERE id = %s",
                 (sketch_id,)
             )
-            
+
             if exists:
                 Logger.warning(f"Usuario {user_id} no autorizado para acceder al sketch {sketch_id}")
                 return jsonify({
@@ -5551,7 +6106,7 @@ def delete_sketch(sketch_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -5561,17 +6116,17 @@ def delete_sketch(sketch_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -5580,7 +6135,7 @@ def delete_sketch(sketch_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -5656,7 +6211,7 @@ def update_sketch(sketch_id):
 
     Args:
         sketch_id (int): ID del sketch a actualizar
-        
+
 
     Request body:
     {
@@ -5688,7 +6243,7 @@ def update_sketch(sketch_id):
             if field not in request_data:
                 Logger.error(f"Campo requerido faltante: {field}")
                 return jsonify({
-                    "status": "error", 
+                    "status": "error",
                     "message": "Faltan campos requeridos",
                     "details": f"El campo '{field}' es requerido"
                 }), 400
@@ -5720,7 +6275,7 @@ def update_sketch(sketch_id):
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -5730,17 +6285,17 @@ def update_sketch(sketch_id):
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -5749,7 +6304,7 @@ def update_sketch(sketch_id):
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -5801,7 +6356,7 @@ def update_sketch(sketch_id):
                 "message": "Falta información de topología",
                 "details": "El campo topology_info es requerido"
             }), 400
-        
+
         # Obtener IDs únicos
         flavor_ids = {str(vm['flavor_id']) for vm in topology.get('vms', [])}
         image_ids = {str(vm['image_id']) for vm in topology.get('vms', [])}
@@ -5820,11 +6375,11 @@ def update_sketch(sketch_id):
             """SELECT id FROM flavor 
                WHERE id IN (%s) 
                AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+               AND (user IS NULL OR user = %s)""" %
             (','.join(flavor_ids), user_id)
         )
         valid_flavor_ids = {str(f['id']) for f in valid_flavors}
-        
+
         invalid_flavors = flavor_ids - valid_flavor_ids
         if invalid_flavors:
             Logger.error(f"Flavors inválidos o no accesibles: {invalid_flavors}")
@@ -5840,17 +6395,17 @@ def update_sketch(sketch_id):
             """SELECT id FROM image 
                WHERE id IN (%s) 
                AND state = 'active'
-               AND (user IS NULL OR user = %s)""" % 
+               AND (user IS NULL OR user = %s)""" %
             (','.join(image_ids), user_id)
         )
         valid_image_ids = {str(i['id']) for i in valid_images}
-        
+
         invalid_images = image_ids - valid_image_ids
         if invalid_images:
             Logger.error(f"Images inválidas o no accesibles: {invalid_images}")
             return jsonify({
                 "status": "error",
-                "message": "Algunas imágenes no son válidas o no tienes acceso a ellas", 
+                "message": "Algunas imágenes no son válidas o no tienes acceso a ellas",
                 "details": f"Las siguientes imágenes no existen, no están activas o no tienes permiso: {list(invalid_images)}"
             }), 400
 
@@ -5877,7 +6432,7 @@ def update_sketch(sketch_id):
             SET structure = %s, updated_at = NOW()
             WHERE id = %s AND user = %s
         """
-        
+
         db.execute_transaction([
             (update_query, (json.dumps(structure), sketch_id, user_id))
         ])
@@ -5910,9 +6465,9 @@ def update_sketch(sketch_id):
 def list_sketches():
     """
     Obtiene todos los sketches de un usuario específico.
-    
+
     Query params:
-        
+
 
     Returns:
         Response: Lista de sketches del usuario
@@ -5922,7 +6477,7 @@ def list_sketches():
     """
     try:
         Logger.major_section("API: LIST USER SKETCHES")
-        
+
         # Validar user_id
         auth_token = request.headers.get('Authorization')
         if not auth_token:
@@ -5932,7 +6487,7 @@ def list_sketches():
                 "message": "No autorizado",
                 "details": "Se requiere token de autorización"
             }), 401
-            
+
         # Obtener username y rol del token
         username = jwt_manager.get_username_from_token(auth_token)
         if not username:
@@ -5942,17 +6497,17 @@ def list_sketches():
                 "message": "Token inválido o expirado",
                 "details": "El token de autorización no es válido o ha expirado"
             }), 401
-            
+
         # Obtener rol del token
         role = jwt_manager.get_role_from_token(auth_token)
         Logger.debug(f"Rol del usuario: {role}")
-            
+
         # Obtener user_id desde username
         token_user_id = jwt_manager.get_user_id_from_username(username, db)
         if not token_user_id:
             Logger.error(f"Usuario no encontrado: {username}")
             return jsonify({
-                "status": "error", 
+                "status": "error",
                 "message": "Usuario no encontrado",
                 "details": f"No se encontró el usuario con username: {username}"
             }), 404
@@ -5961,7 +6516,7 @@ def list_sketches():
         query_user_id = request.args.get('user_id')
         if query_user_id:
             query_user_id = int(query_user_id)
-            
+
             # Si el user_id del query es diferente al del token, verificar si es Admin
             if query_user_id != token_user_id:
                 if role != 'Admin':
@@ -5988,7 +6543,7 @@ def list_sketches():
             ORDER BY s.created_at DESC
         """
         sketches = db.execute_query(query, (user_id,))
-        
+
         # Formatear respuesta
         formatted_sketches = []
         for sketch in sketches:
@@ -6027,32 +6582,35 @@ def list_sketches():
 if __name__ == '__main__':
     try:
         Logger.major_section("INICIANDO SLICE MANAGER")
-        
+
         # Inicializar componentes
         Logger.info("Inicializando componentes del sistema...")
-        
+
         # Base de datos
         Logger.debug("Conectando a base de datos...")
         db = DatabaseManager()
         Logger.success("Conexión a base de datos establecida")
-        
+
         # Gestor de tokens VNC
         Logger.debug("Inicializando gestor de tokens VNC...")
         vnc_token_manager = VNCTokenManager()
         Logger.success("Gestor de tokens VNC inicializado")
 
+        # Configurar limpieza de reservas
+        setup_cleanup_scheduler()
+
         # Gestor de tokens JWT del Usuario
         Logger.debug("Inicializando gestor de tokens JWT...")
         jwt_manager = JWTManager()
         Logger.success("Gestor de tokens JWT inicializado")
-        
+
         # Configuración del servidor
         host = '0.0.0.0'
         port = 5001
         debug = False
 
         Logger.section("INICIANDO SERVIDOR WEB")
-        
+
         Logger.info(f"Iniciando servidor en {host}:{port}")
         Logger.info("Presione Ctrl+C para detener el servidor")
         Logger.success("Slice Manager listo para recibir conexiones")
@@ -6064,7 +6622,7 @@ if __name__ == '__main__':
             debug=debug,
             threaded=True  # Habilitar múltiples threads
         )
-        
+
     except Exception as e:
         Logger.error(f"Error iniciando el servidor: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
