@@ -2,10 +2,10 @@
 # | ARCHIVO: slice_manager.py
 # ==============================================================================
 # | DESCRIPCIÓN:
-# | API REST que implementa la interfaz de gestión y administración de slices, actuando como
-# | intermediario entre el frontend y el servidor de despliegue/control.
+# | Módulo API REST que implementa la interfaz de gestión y administración de slices, actuando como
+# | intermediario entre el frontend y el módulo de despliegue/control (Linux y OpenStack Driver).
 # | Maneja la persistencia en BD, validación de requests, y comunicación con
-# | el servidor de despliegue.
+# | los drivers.
 # ==============================================================================
 # | CONTENIDO PRINCIPAL:
 # | 1. CONFIGURACIÓN INICIAL
@@ -39,7 +39,8 @@
 # |    - /pause-vm, /resume-vm, /restart-vm: Control de VMs
 # |    - /vm-vnc, /vm-token: Acceso VNC
 # |    - /slice/[id]: Información de slices
-# |    - /resources/*: Gestión de recursos
+# |    - /resources/flavors, /resources/images: Gestión de recursos
+# |    - /create-sketch, /sketch/[id], /list-sketches: Gestión de sketches
 # |
 # | 6. UTILIDADES
 # |    - Logger personalizado con niveles y colores
@@ -84,6 +85,9 @@ app = Flask(__name__)
 sock = Sock(app)
 CORS(app)
 
+host = '0.0.0.0'
+port = 5001
+debug = True
 
 # ===================== CONFIGURACIÓN DE EUREKA =====================
 eureka_server = "http://localhost:8761"
@@ -2086,6 +2090,40 @@ def deploy_slice():
         request_data = request.get_json()
         Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
+        # 0. Validar user_id en token
+        auth_token = request.headers.get('Authorization')
+        if not auth_token:
+            Logger.error("No se proporcionó token de autorización")
+            return jsonify({
+                "status": "error",
+                "message": "No autorizado",
+                "details": "Se requiere token de autorización"
+            }), 401
+
+        # Obtener username y rol del token
+        username = jwt_manager.get_username_from_token(auth_token)
+        if not username:
+            Logger.error("Token inválido o expirado")
+            return jsonify({
+                "status": "error",
+                "message": "Token inválido o expirado",
+                "details": "El token de autorización no es válido o ha expirado"
+            }), 401
+
+        # Obtener rol del token
+        role = jwt_manager.get_role_from_token(auth_token)
+        Logger.debug(f"Rol del usuario: {role}")
+
+        # Obtener user_id desde username
+        token_user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not token_user_id:
+            Logger.error(f"Usuario no encontrado: {username}")
+            return jsonify({
+                "status": "error",
+                "message": "Usuario no encontrado",
+                "details": f"No se encontró el usuario con username: {username}"
+            }), 404
+
         # 1. Validar estructura básica del request
         if 'slice_info' not in request_data:
             Logger.error("Request sin slice_info")
@@ -2858,6 +2896,7 @@ def cleanup_reserved_resources(slice_id):
         if 'conn' in locals() and conn:
             conn.close()
 
+
 def cleanup_orphaned_reservations():
     """
     Limpia reservas temporales que llevan más de 1 hora sin completar el despliegue.
@@ -3415,7 +3454,7 @@ def pause_vm_endpoint(vm_id: str):
         Logger.info(f"VM ID-{vm['id']} con nombre '{vm['name']}' encontrada en Worker ID-{vm['worker_id']} con nombre {vm['worker_name']}")
 
 
-        # 2. Preparar datos para Slice Controller
+        # 2. Preparar datos para Linux Driver
         Logger.debug("Preparando datos para servidor de despliegue")
         pause_data = {
             "vm_info": {
@@ -3437,14 +3476,14 @@ def pause_vm_endpoint(vm_id: str):
             "slice_id": vm['slice_id']
         }
 
-        # 3. Enviar solicitud a Slice Controller
+        # 3. Enviar solicitud a Linux Driver
         Logger.info("Enviando solicitud de pausa al servidor de despliegue")
-        slice_controller = get_service_instance('slice-controller')
-        if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible")
+        linux_driver = get_service_instance('linux-driver')
+        if not linux_driver:
+            raise Exception("Servicio linux-driver no disponible")
 
         response = requests.post(
-            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/pause-vm/{vm_id}",
+            f"http://{linux_driver['ipAddr']}:{linux_driver['port']}/pause-vm/{vm_id}",
             json=pause_data,
             timeout=300
         )
@@ -3469,7 +3508,7 @@ def pause_vm_endpoint(vm_id: str):
 
             return jsonify({
                 "status": "success",
-                "message": f"La máquina virtual con nombre '{vm['name']}' ha sido pausada exitosamente",
+                "message": f"La máquina virtual con nombre '{vm['name']}' ha sido apagada exitosamente",
                 "content": {
                     "vm_id": vm['id'],
                     "name": vm['name'],
@@ -3649,7 +3688,7 @@ def resume_vm_endpoint(vm_id: str):
             (vm_id,)
         )
 
-        # 4. Preparar datos para Slice Controller
+        # 4. Preparar datos para Linux Driver
         Logger.debug("Preparando datos para servidor de despliegue")
         resume_data = {
             "vm_info": {
@@ -3692,14 +3731,14 @@ def resume_vm_endpoint(vm_id: str):
             "slice_id": vm['slice_id']
         }
 
-        # 5. Enviar solicitud a Slice Controller
+        # 5. Enviar solicitud a Linux Driver
         Logger.info("Enviando solicitud de reanudación al servidor de despliegue")
-        slice_controller = get_service_instance('slice-controller')
-        if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible")
+        linux_driver = get_service_instance('linux-driver')
+        if not linux_driver:
+            raise Exception("Servicio linux-driver no disponible")
 
         response = requests.post(
-            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/resume-vm/{vm_id}",
+            f"http://{linux_driver['ipAddr']}:{linux_driver['port']}/resume-vm/{vm_id}",
             json=json.loads(json.dumps(resume_data, default=json_handler)),
             timeout=300
         )
@@ -3733,7 +3772,7 @@ def resume_vm_endpoint(vm_id: str):
 
             return jsonify({
                 "status": "success",
-                "message": f"La máquina virtual con nombre '{vm['name']}' ha sido reanudada exitosamente",
+                "message": f"La máquina virtual con nombre '{vm['name']}' ha sido encendida exitosamente",
                 "content": {
                     "vm_id": vm_id,
                     "name": vm['name'],
@@ -3906,7 +3945,7 @@ def restart_vm_endpoint(vm_id: str):
             (vm_id,)
         )
 
-        # 2. Preparar datos para Slice Controller
+        # 2. Preparar datos para Linux Driver
         Logger.debug("Preparando datos para servidor de despliegue")
         vm_image = f"vm-{vm['id']}-slice-{vm['slice_id']}.qcow2"
         vm_image_path = f"/home/ubuntu/SliceManager/images/{vm_image}"
@@ -3938,14 +3977,14 @@ def restart_vm_endpoint(vm_id: str):
             "slice_id": vm['slice_id']
         }
 
-        # 3. Enviar solicitud a Slice Controller
+        # 3. Enviar solicitud a Linux Driver
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
-        slice_controller = get_service_instance('slice-controller')
-        if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible")
+        linux_driver = get_service_instance('linux-driver')
+        if not linux_driver:
+            raise Exception("Servicio linux-driver no disponible")
 
         response = requests.post(
-            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-vm/{vm_id}",
+            f"http://{linux_driver['ipAddr']}:{linux_driver['port']}/restart-vm/{vm_id}",
             json=json.loads(json.dumps(restart_data, default=json_handler)),
             timeout=300
         )
@@ -4148,7 +4187,7 @@ def restart_slice_endpoint(slice_id: str):
             JOIN physical_server ps ON vm.physical_server = ps.id
             JOIN flavor f ON vm.flavor = f.id
             JOIN image i ON vm.image = i.id
-            WHERE s.id = %s AND vm.status = 'running'
+            WHERE s.id = %s AND (vm.status = 'running' OR vm.status = 'paused')
         """
         result = db.execute_query(query, (slice_id,))
 
@@ -4247,14 +4286,14 @@ def restart_slice_endpoint(slice_id: str):
             "workers": workers
         }
 
-        # 5. Enviar request a Slice Controller
+        # 5. Enviar request a Linux Driver
         Logger.info("Enviando solicitud de reinicio al servidor de despliegue")
-        slice_controller = get_service_instance('slice-controller')
-        if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible")
+        linux_driver = get_service_instance('linux-driver')
+        if not linux_driver:
+            raise Exception("Servicio linux-driver no disponible")
 
         response = requests.post(
-            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/restart-slice/{slice_id}",
+            f"http://{linux_driver['ipAddr']}:{linux_driver['port']}/restart-slice/{slice_id}",
             json=json.loads(json.dumps(restart_data, default=str)),
             timeout=300
         )
@@ -4560,14 +4599,14 @@ def stop_slice_endpoint(slice_id: str):
                     }
                     Logger.debug(f"Worker registrado: {row['worker_name']}")
 
-        # 3. Enviar request a Slice Controller
+        # 3. Enviar request a Linux Driver
         Logger.info("Enviando solicitud de detención al servidor de despliegue")
-        slice_controller = get_service_instance('slice-controller')
-        if not slice_controller:
-            raise Exception("Servicio slice-controller no disponible")
+        linux_driver = get_service_instance('linux-driver')
+        if not linux_driver:
+            raise Exception("Servicio linux-driver no disponible")
 
         response = requests.post(
-            f"http://{slice_controller['ipAddr']}:{slice_controller['port']}/stop-slice/{slice_id}",
+            f"http://{linux_driver['ipAddr']}:{linux_driver['port']}/stop-slice/{slice_id}",
             json=stop_data,
             timeout=300
         )
@@ -6583,7 +6622,7 @@ if __name__ == '__main__':
     try:
         Logger.major_section("INICIANDO SLICE MANAGER")
 
-        # Inicializar componentes
+        # 1. Inicializar componentes
         Logger.info("Inicializando componentes del sistema...")
 
         # Base de datos
@@ -6596,31 +6635,30 @@ if __name__ == '__main__':
         vnc_token_manager = VNCTokenManager()
         Logger.success("Gestor de tokens VNC inicializado")
 
-        # Configurar limpieza de reservas
+        # 2. Configurar limpieza de reservas
         setup_cleanup_scheduler()
 
-        # Gestor de tokens JWT del Usuario
+        # 3. Inicializar gestor de tokens JWT del Usuario
         Logger.debug("Inicializando gestor de tokens JWT...")
         jwt_manager = JWTManager()
         Logger.success("Gestor de tokens JWT inicializado")
 
-        # Configuración del servidor
-        host = '0.0.0.0'
-        port = 5001
-        debug = False
-
+        # 4. Iniciar servidor Flask
         Logger.section("INICIANDO SERVIDOR WEB")
-
-        Logger.info(f"Iniciando servidor en {host}:{port}")
-        Logger.info("Presione Ctrl+C para detener el servidor")
+        Logger.info("Configuración del servidor:")
+        Logger.info(f"- Puerto: {port}")
+        Logger.info(f"- Debug: {debug}")
+        
+        Logger.debug("Iniciando servidor Flask...")
         Logger.success("Slice Manager listo para recibir conexiones")
+        
 
         # Iniciar servidor Flask
         app.run(
             host=host,
             port=port,
             debug=debug,
-            threaded=True  # Habilitar múltiples threads
+            threaded=True
         )
 
     except Exception as e:

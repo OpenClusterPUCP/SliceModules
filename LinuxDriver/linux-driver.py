@@ -1,9 +1,9 @@
 # ==============================================================================
-# | ARCHIVO: server_multi.py
+# | ARCHIVO: linux_driver.py
 # ==============================================================================
 # | DESCRIPCIÓN:
-# | Servidor Flask que implementa el backend para el despligue de slices 
-# | de red en un clúster. Realiza el despliegue, configuración y gestión de VMs,
+# | Módulo que implementa el backend para el control de vida de lices 
+# | de red en un clúster Línux. Realiza el despliegue, configuración y gestión de VMs,
 # | redes virtuales y recursos distribuidos a través de múltiples nodos workers.
 # ==============================================================================
 # | CONTENIDO PRINCIPAL:
@@ -77,13 +77,16 @@ app = Flask(__name__, static_url_path='/static', static_folder='static')
 sock = Sock(app)
 CORS(app)
 
+host = '0.0.0.0'
+port = 5000
+debug = True
 
 # ===================== CONFIGURACIÓN DE EUREKA =====================
 eureka_server = "http://localhost:8761"
 
 eureka_client.init(
     eureka_server=eureka_server,
-    app_name="slice-controller",
+    app_name="linux-driver",
     instance_port=5000,
     instance_host="localhost",    
     renewal_interval_in_secs=30,
@@ -643,8 +646,6 @@ class SliceManager:
             current_stage = 'worker_setup'
             Logger.section("FASE 3: CONFIGURACIÓN DE WORKERS")
 
-
-            
             for worker_name, worker_data in vms_by_worker.items():
                 thread = threading.Thread(
                     target=self._worker_setup,
@@ -693,30 +694,109 @@ class SliceManager:
             self._cleanup_deployment_state(slice_config, current_stage)
             raise Exception(error_msg)
 
+    # def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict, 
+    #                 results: dict, errors: dict):
+    #     """
+    #     Configura un worker específico para el despliegue de sus VMs asignadas.
+        
+    #     Realiza la configuración completa de un worker incluyendo:
+    #     1. Configuración de bridges OVS
+    #     2. Configuración de interfaces TAP
+    #     3. Preparación de imágenes
+    #     4. Inicio de VMs
+        
+    #     Args:
+    #         worker_info (dict): Información del worker a configurar
+    #         vms (list): Lista de VMs a desplegar en este worker
+    #         slice_config (dict): Configuración completa del slice
+    #         results (dict): Diccionario para almacenar resultados
+    #         errors (dict): Diccionario para almacenar errores
+    #     """
+    #     try:
+    #         Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
+    #         Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
+    #         Logger.info(f"VMs a configurar: {len(vms)}")
+
+    #         # Preparar información SSH
+    #         ssh_info = {
+    #             'name': worker_info['name'],
+    #             'ip': worker_info['ip'],
+    #             'ssh_username': worker_info['ssh_username'],
+    #             'ssh_password': worker_info.get('ssh_password'),
+    #             'ssh_key_path': worker_info.get('ssh_key_path')
+    #         }
+
+    #         with SSHManager(ssh_info) as ssh:
+    #             # 1. Configuración de bridges
+    #             Logger.info(f"Configurando bridges en {worker_info['name']}...")
+    #             bridge_commands = self._generate_bridge_commands(slice_config['network_config'])
+    #             Logger.debug(f"Comandos bridge: {' && '.join(bridge_commands)}")
+    #             ssh.execute(" && ".join(bridge_commands))
+                
+    #             # 2. Configuración de interfaces TAP
+    #             Logger.info(f"Configurando interfaces TAP en {worker_info['name']}...")
+    #             tap_commands = self._generate_tap_commands(vms, slice_config)
+                
+    #             if tap_commands:
+    #                 Logger.debug(f"Ejecutando comandos TAP: {' && '.join(tap_commands)}")
+    #                 ssh.execute(" && ".join(tap_commands))
+
+
+    #             #Logger.info(f"Preparando imágenes en {worker_info['name']}...")
+    #             # image_commands = self._generate_image_commands(vms, slice_config)
+    #             #if image_commands:
+    #             #    Logger.debug(f"Comandos imagen: {' && '.join(image_commands)}")
+    #             #    ssh.execute(" && ".join(image_commands))
+
+    #             # 3. Iniciar VMs
+    #             vm_results = []
+    #             for vm in vms:
+    #                 Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
+    #                 self._start_single_vm(ssh, vm, slice_config)
+                    
+    #                 # Verificar estado
+    #                 stdout, _ = ssh.execute(
+    #                     f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
+    #                 )
+    #                 if stdout.strip():
+    #                     qemu_pid = int(stdout.split()[0])
+    #                     Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
+    #                     vm_results.append({
+    #                         'id': vm['id'],
+    #                         'qemu_pid': qemu_pid,
+    #                         'status': 'running'
+    #                     })
+
+    #             results[worker_info['name']] = {
+    #                 'success': True,
+    #                 'vms': vm_results
+    #             }
+    #             Logger.success(f"Configuración de {worker_info['name']} completada")
+                    
+    #     except Exception as e:
+    #         error_msg = f"Error en worker {worker_info['name']}: {str(e)}"
+    #         Logger.error(error_msg)
+    #         Logger.debug(f"Traceback: {traceback.format_exc()}")
+    #         errors[worker_info['name']] = str(e)
+    #         results[worker_info['name']] = {
+    #             'success': False,
+    #             'error': str(e)
+    #         }
+
     def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict, 
                     results: dict, errors: dict):
         """
         Configura un worker específico para el despliegue de sus VMs asignadas.
         
-        Realiza la configuración completa de un worker incluyendo:
-        1. Configuración de bridges OVS
-        2. Configuración de interfaces TAP
-        3. Preparación de imágenes
-        4. Inicio de VMs
-        
-        Args:
-            worker_info (dict): Información del worker a configurar
-            vms (list): Lista de VMs a desplegar en este worker
-            slice_config (dict): Configuración completa del slice
-            results (dict): Diccionario para almacenar resultados
-            errors (dict): Diccionario para almacenar errores
+        La configuración se realiza en dos fases:
+        1. Serie: Configuración de red (bridges y TAPs)
+        2. Paralelo: Inicio de VMs usando múltiples conexiones SSH
         """
         try:
             Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
             Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
             Logger.info(f"VMs a configurar: {len(vms)}")
 
-            # Preparar información SSH
             ssh_info = {
                 'name': worker_info['name'],
                 'ip': worker_info['ip'],
@@ -725,6 +805,7 @@ class SliceManager:
                 'ssh_key_path': worker_info.get('ssh_key_path')
             }
 
+            # FASE 1: Configuración de red (en serie)
             with SSHManager(ssh_info) as ssh:
                 # 1. Configuración de bridges
                 Logger.info(f"Configurando bridges en {worker_info['name']}...")
@@ -732,46 +813,66 @@ class SliceManager:
                 Logger.debug(f"Comandos bridge: {' && '.join(bridge_commands)}")
                 ssh.execute(" && ".join(bridge_commands))
                 
-                # 2. Configuración de interfaces TAP - MODIFICADO
+                # 2. Configuración de interfaces TAP
                 Logger.info(f"Configurando interfaces TAP en {worker_info['name']}...")
                 tap_commands = self._generate_tap_commands(vms, slice_config)
-                
                 if tap_commands:
                     Logger.debug(f"Ejecutando comandos TAP: {' && '.join(tap_commands)}")
                     ssh.execute(" && ".join(tap_commands))
 
-                # 3. Preparar imágenes
-                Logger.info(f"Preparando imágenes en {worker_info['name']}...")
-                image_commands = self._generate_image_commands(vms, slice_config)
-                if image_commands:
-                    Logger.debug(f"Comandos imagen: {' && '.join(image_commands)}")
-                    ssh.execute(" && ".join(image_commands))
+            # FASE 2: Inicio paralelo de VMs
+            vm_threads = []
+            vm_results_dict = {}
+            vm_errors_dict = {}
+            thread_lock = threading.Lock()
 
-                # 4. Iniciar VMs
-                vm_results = []
-                for vm in vms:
-                    Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
-                    self._start_single_vm(ssh, vm, slice_config)
-                    
-                    # Verificar estado
-                    stdout, _ = ssh.execute(
-                        f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
-                    )
-                    if stdout.strip():
-                        qemu_pid = int(stdout.split()[0])
-                        Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
-                        vm_results.append({
-                            'id': vm['id'],
-                            'qemu_pid': qemu_pid,
-                            'status': 'running'
-                        })
+            def start_vm_thread(vm):
+                try:
+                    with SSHManager(ssh_info) as vm_ssh:
+                        Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
+                        self._start_single_vm(vm_ssh, vm, slice_config)
+                        
+                        # Verificar estado
+                        stdout, _ = vm_ssh.execute(
+                            f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
+                        )
+                        if stdout.strip():
+                            qemu_pid = int(stdout.split()[0])
+                            Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
+                            with thread_lock:
+                                vm_results_dict[vm['id']] = {
+                                    'id': vm['id'],
+                                    'qemu_pid': qemu_pid,
+                                    'status': 'running'
+                                }
+                except Exception as e:
+                    error_msg = f"Error iniciando VM ID-{vm['id']}: {str(e)}"
+                    Logger.error(error_msg)
+                    with thread_lock:
+                        vm_errors_dict[vm['id']] = error_msg
 
-                results[worker_info['name']] = {
-                    'success': True,
-                    'vms': vm_results
-                }
-                Logger.success(f"Configuración de {worker_info['name']} completada")
-                    
+            # Crear y comenzar threads para cada VM
+            for vm in vms:
+                thread = threading.Thread(target=start_vm_thread, args=(vm,))
+                vm_threads.append(thread)
+                thread.start()
+
+            # Esperar a que todos los threads terminen
+            for thread in vm_threads:
+                thread.join()
+
+            # Procesar resultados
+            if vm_errors_dict:
+                error_messages = [f"VM ID-{vm_id}: {error}" 
+                                for vm_id, error in vm_errors_dict.items()]
+                raise Exception("Errores iniciando VMs:\n" + "\n".join(error_messages))
+
+            results[worker_info['name']] = {
+                'success': True,
+                'vms': list(vm_results_dict.values())
+            }
+            Logger.success(f"Configuración de {worker_info['name']} completada")
+
         except Exception as e:
             error_msg = f"Error en worker {worker_info['name']}: {str(e)}"
             Logger.error(error_msg)
@@ -943,12 +1044,27 @@ class SliceManager:
             Logger.debug(f"Imagen VM: {vm_image}")
             Logger.debug(f"Tamaño disco: {flavor_info['disk']}G")
             
-            disk_size_mb = int(flavor_info['disk'] * 1024)
+            # Calcular tamaño exacto en bytes para 2GB
+            desired_size_gb = flavor_info['disk']
+            size_bytes = int(desired_size_gb * (1024 * 1024 * 1024))
+            adjusted_size_bytes = ((size_bytes + 511) // 512) * 512
 
+            # Convertir a MB para qemu-img
+            adjusted_size_mb = adjusted_size_bytes // (1024 * 1024)
+
+            # Copiar y redimensionar imagen usando los MB
             ssh.execute(f"sudo cp {base_path} {vm_image_path}")
-            ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {disk_size_mb}M")
+            ssh.execute(f"sudo qemu-img resize {vm_image_path} {adjusted_size_mb}M")
             ssh.execute(f"sudo chmod 644 {vm_image_path}")
-            
+
+            # Verificar el tamaño final
+            stdout, _ = ssh.execute(f"qemu-img info {vm_image_path}")
+            Logger.debug(f"Información de imagen después del resize:\n{stdout}")
+
+            # Verificar el tamaño final
+            stdout, _ = ssh.execute(f"qemu-img info {vm_image_path}")
+            Logger.debug(f"Información de imagen después del resize:\n{stdout}")
+
             # Verificar imagen creada
             Logger.info("Verificando imagen creada...")
             stdout, _ = ssh.execute(f"ls -lh {vm_image_path}")
@@ -3449,7 +3565,7 @@ def handle_error(error):
 # ===================== SERVER =====================
 if __name__ == '__main__':
     try:
-        Logger.major_section("INICIANDO SLICE CONTROLLER")
+        Logger.major_section("INICIANDO LINUX DRIVER")
         
         # 1. Inicializar estructura de directorios
         Logger.info("Verificando estructura de directorios...")
@@ -3457,24 +3573,20 @@ if __name__ == '__main__':
             Logger.error("Error crítico: No se pudo crear la estructura de directorios")
             raise Exception("No se pudo crear la estructura de directorios necesaria")
         Logger.success("Estructura de directorios verificada")
-        
-        # 2. Inicializar servicios
-        Logger.section("INICIANDO SERVICIOS")
-        
-        # 3. Iniciar servidor Flask
+           
+        # 2. Iniciar servidor Flask
         Logger.section("INICIANDO SERVIDOR WEB")
         Logger.info("Configuración del servidor:")
-        Logger.info("- Host: 0.0.0.0")
-        Logger.info("- Puerto: 5000")
-        Logger.info("- Debug: Activado")
+        Logger.info(f"- Puerto: {port}")
+        Logger.info(f"- Debug: {debug}")
         
-        Logger.success("Slice Controller listo para recibir conexiones")
         Logger.debug("Iniciando servidor Flask...")
+        Logger.success("Linux Driver listo para recibir conexiones")
         
         app.run(
-            host='0.0.0.0',
-            port=5000, 
-            debug=True
+            host=host,
+            port=port, 
+            debug=debug
         )
         
     except Exception as e:
