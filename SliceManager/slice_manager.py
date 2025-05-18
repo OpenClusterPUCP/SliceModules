@@ -4969,8 +4969,20 @@ def stop_slice_endpoint(slice_id: str):
                 WHERE id = %s
             """
 
+            # Nuevo query para limpiar IPs de interfaces externas
+            update_interfaces_query = """
+                UPDATE interface i
+                JOIN virtual_machine vm ON i.vm = vm.id
+                SET i.ip = NULL
+                WHERE vm.slice = %s 
+                AND i.external_access = true
+            """
+
             # Construir transacción
-            transactions = [(update_slice_query, (slice_id,))]
+            transactions = [
+                (update_slice_query, (slice_id,)),
+                (update_interfaces_query, (slice_id,))  # Agregar limpieza de IPs
+            ]
 
             # Agregar actualizaciones de VMs
             for vm in stop_data['vms']:

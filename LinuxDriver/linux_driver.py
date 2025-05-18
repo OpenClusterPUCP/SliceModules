@@ -1462,37 +1462,44 @@ class SliceManager:
                 dhcp_config = self._generate_dhcp_config(network_config, namespace_name,external_interfaces)
                 self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
 
-                # 7. Configurar NAT y forwarding en el host
-                nat_commands = [
-                    # NAT general para toda la red del slice
-                    f"sudo iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-                    f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
-                    f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-                    "sudo sysctl -w net.ipv4.ip_forward=1"
-                ]
-
                 # Agregar reglas para acceso externo específico
                 ip_assignments = network_config.get('ip_assignments', {})
                 Logger.debug(f"Asignaciones IP: {json.dumps(ip_assignments, indent=2)}")
 
+                # 7. Configurar NAT y forwarding en el host
+                nat_commands = [
+                    # Política por defecto y forwarding
+                    "sudo iptables -P FORWARD DROP",
+                    "sudo sysctl -w net.ipv4.ip_forward=1",
+                    
+                    # NAT general para toda la red del slice
+                    f"sudo iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                    
+                    # Permitir tráfico saliente hacia internet
+                    f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+                    
+                    # Permitir respuestas establecidas desde internet
+                    f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT"
+                ]
+
+                # Configuración para interfaces con acceso externo
                 for mac, ips in ip_assignments.items():
                     internal_ip = ips['internal_ip']
                     external_ip = ips['external_ip']
                     
                     if external_ip:  # Solo si tiene IP externa asignada
-                        # NAT bidireccional para acceso externo
                         nat_commands.extend([
-                            # DNAT para acceso desde exterior (10.60.11.0/24) hacia la VM
+                            # DNAT para acceso desde exterior
                             f"sudo iptables -t nat -C PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip}",
                             
-                            # SNAT para respuestas desde la VM hacia el exterior
+                            # SNAT para respuestas
                             f"sudo iptables -t nat -C POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip}",
                             
-                            # Permitir acceso desde el exterior
+                            # Permitir acceso desde exterior
                             f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT",
                             
-                            # Permitir respuestas desde la VM
-                            f"sudo iptables -C FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT"
+                            # Permitir respuestas desde la VM hacia el exterior (para conexiones establecidas)
+                            f"sudo iptables -C FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -m state --state ESTABLISHED,RELATED -j ACCEPT"
                         ])
                         
                         Logger.debug(f"Configurado NAT bidireccional: {external_ip} <-> {internal_ip}")
