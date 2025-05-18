@@ -51,7 +51,11 @@
 # ==============================================================================
 
 # ===================== IMPORTACIONES =====================
-from flask import Flask, request, jsonify, render_template
+#import eventlet
+#eventlet.monkey_patch()
+
+
+from flask import Flask, request, jsonify, render_template, make_response
 from py_eureka_client import eureka_client
 from flask_cors import CORS
 from flask_sock import Sock
@@ -78,25 +82,44 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from typing import Dict, List, Union, Tuple, Optional
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 
 # ===================== CONFIGURACIÓN DE FLASK =====================
 app = Flask(__name__)
+
+# Inicializar Sock para WebSocket nativo (VNC)
 sock = Sock(app)
-CORS(app)
+
+# Configurar SocketIO para eventos en tiempo real (notificaciones)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading',  # <-- USAR THREADING
+    logger=False,
+    engineio_logger=False,
+    path='/socket.io/'
+)
+
+# Configurar CORS
+CORS(app, origins="*", supports_credentials=True)
+
+# Diccionario para mapear usuarios a sus conexiones WebSocket
+user_connections = {}
 
 host = '0.0.0.0'
 port = 5001
 debug = True
 
 # ===================== CONFIGURACIÓN DE EUREKA =====================
-eureka_server = "http://localhost:8761"
+eureka_server = "http://10.0.10.1:8761"
 
+# Configuración más explícita
 eureka_client.init(
     eureka_server=eureka_server,
     app_name="slice-manager",
     instance_port=5001,
-    instance_host="localhost",
+    instance_host="10.0.10.1",
     renewal_interval_in_secs=30,
     duration_in_secs=90,
 )
@@ -203,10 +226,10 @@ def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, p
 
 # ===================== CONFIGURACIÓN BD =====================
 DB_CONFIG = {
-    "host": "localhost",
+    "host": "10.0.10.4",
     "user": "root",
-    "password": "root",
-    "port": 3306,
+    "password": "Branko",
+    "port": 4000,
     "database": "cloud_v3"
 }
 
@@ -2010,6 +2033,122 @@ class SliceProcessor:
                 conn.close()
 
 
+# ===================== WEBSOCKET HANDLERS =====================
+
+def emit_to_user(user_id, event, data):
+    """
+    Emite un evento a todas las conexiones WebSocket de un usuario específico.
+    """
+    try:
+        Logger.info(f"Intentando emitir evento '{event}' a usuario {user_id}")
+        Logger.debug(f"Datos a emitir: {json.dumps(data, indent=2)}")
+
+        if user_id in user_connections and user_connections[user_id]:
+            room_name = f"user_{user_id}"
+            socketio.emit(event, data, room=room_name)
+            Logger.success(f"Evento '{event}' emitido a usuario {user_id} en room {room_name}")
+            Logger.debug(f"Conexiones activas del usuario: {len(user_connections[user_id])}")
+        else:
+            Logger.warning(f"Usuario {user_id} no tiene conexiones WebSocket activas")
+            Logger.debug(f"Usuarios conectados: {list(user_connections.keys())}")
+            Logger.debug(f"Conexiones del usuario {user_id}: {user_connections.get(user_id, 'None')}")
+    except Exception as e:
+        Logger.error(f"Error emitiendo evento a usuario {user_id}: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+
+@socketio.on('connect')
+def handle_connect(auth):
+    """
+    Maneja nuevas conexiones WebSocket.
+    Requiere token JWT válido en el objeto auth.
+    """
+    try:
+        Logger.info(f"Nueva conexión WebSocket: {request.sid}")
+
+        # Validar token de autenticación
+        token = auth.get('token') if auth else None
+        if not token:
+            Logger.warning(f"Conexión rechazada - sin token: {request.sid}")
+            return False
+
+        # Obtener user_id del token
+        username = jwt_manager.get_username_from_token(f"Bearer {token}")
+        if not username:
+            Logger.warning(f"Conexión rechazada - token inválido: {request.sid}")
+            return False
+
+        user_id = jwt_manager.get_user_id_from_username(username, db)
+        if not user_id:
+            Logger.warning(f"Conexión rechazada - usuario no encontrado: {request.sid}")
+            return False
+
+        # Agregar a sala personal del usuario
+        join_room(f"user_{user_id}")
+
+        # Registrar conexión
+        if user_id not in user_connections:
+            user_connections[user_id] = set()
+        user_connections[user_id].add(request.sid)
+
+        Logger.success(f"Usuario {user_id} conectado via WebSocket: {request.sid}")
+
+        # Confirmar conexión
+        emit('connected', {
+            'user_id': user_id,
+            'message': 'Conectado exitosamente al servidor de notificaciones'
+        })
+        return True
+
+    except Exception as e:
+        Logger.error(f"Error en conexión WebSocket: {str(e)}")
+        return False
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """
+    Maneja desconexiones WebSocket.
+    Limpia las referencias de conexión del usuario.
+    """
+    try:
+        Logger.info(f"Desconexión WebSocket: {request.sid}")
+
+        # Remover de user_connections
+        for user_id, connections in list(user_connections.items()):
+            if request.sid in connections:
+                connections.remove(request.sid)
+                leave_room(f"user_{user_id}")
+                Logger.info(f"Usuario {user_id} desconectado: {request.sid}")
+
+                # Limpiar si no hay más conexiones
+                if not connections:
+                    del user_connections[user_id]
+                break
+
+    except Exception as e:
+        Logger.error(f"Error en desconexión WebSocket: {str(e)}")
+
+
+@socketio.on('join_operation')
+def handle_join_operation(data):
+    """
+    Permite al cliente suscribirse a una operación específica.
+    Útil para recibir actualizaciones en tiempo real de operaciones particulares.
+    """
+    try:
+        operation_id = data.get('operation_id')
+        if operation_id:
+            join_room(f"operation_{operation_id}")
+            Logger.debug(f"Cliente {request.sid} se suscribió a operación {operation_id}")
+            emit('joined_operation', {'operation_id': operation_id})
+        else:
+            emit('error', {'message': 'operation_id requerido'})
+
+    except Exception as e:
+        Logger.error(f"Error suscribiendo a operación: {str(e)}")
+        emit('error', {'message': 'Error al suscribirse a la operación'})
+
 # ===================== API ENDPOINTS - SLICE =====================
 """
 Todas las respuestas de la API siguen este formato:
@@ -2087,7 +2226,49 @@ def deploy_slice():
     """
     try:
         Logger.major_section("API: DEPLOY SLICE")
-        request_data = request.get_json()
+        Logger.debug(f"=== REQUEST DEBUG INFO ===")
+        Logger.debug(f"Remote addr: {request.remote_addr}")
+        Logger.debug(f"User-Agent: {request.headers.get('User-Agent', 'No User-Agent')}")
+        Logger.debug(f"Content-Type: {request.content_type}")
+        Logger.debug(f"Content-Length: {request.content_length}")
+        Logger.debug(f"All headers: {dict(request.headers)}")
+        Logger.debug(f"Method: {request.method}")
+        Logger.debug(f"URL: {request.url}")
+        Logger.debug(f"=== END DEBUG INFO ===")
+
+        # Verificar si hay datos
+        raw_data = request.get_data()
+        if not raw_data:
+            Logger.error("Request con cuerpo vacío")
+            return jsonify({
+                "status": "error",
+                "message": "Cuerpo de request vacío",
+                "details": "Se requiere un JSON con la configuración del slice"
+            }), 400
+
+        # Verificar Content-Type
+        if not request.is_json:
+            Logger.error(f"Content-Type inválido: {request.content_type}")
+            return jsonify({
+                "status": "error",
+                "message": "Content-Type debe ser application/json",
+                "details": f"Recibido: {request.content_type}"
+            }), 400
+
+        # Obtener datos JSON
+        try:
+            request_data = request.get_json(force=True)
+            if not request_data:
+                raise ValueError("JSON vacío")
+        except Exception as e:
+            Logger.error(f"Error parseando JSON: {str(e)}")
+            Logger.debug(f"Raw data: {raw_data}")
+            return jsonify({
+                "status": "error",
+                "message": "Error en formato JSON",
+                "details": str(e)
+            }), 400
+
         Logger.debug(f"Request data: {json.dumps(request_data, indent=2)}")
 
         # 0. Validar user_id en token
@@ -2343,6 +2524,15 @@ def deploy_slice():
             operation_id = queue_response.get("operationId")
             Logger.success(f"Solicitud de despliegue encolada. ID de operación: {operation_id}")
 
+            Logger.info(f"Emitiendo notificación inicial a usuario {user_id}")
+            emit_to_user(user_id, 'operation_started', {
+                'operation_id': operation_id,
+                'operation_type': 'DEPLOY_SLICE',
+                'status': 'PENDING',
+                'message': f"Solicitud de despliegue '{processed_config['slice_info']['name']}' encolada",
+                'slice_name': processed_config['slice_info']['name']
+            })
+            Logger.info("Notificación inicial emitida")
 
         except Exception as e:
             # En caso de error, intentar liberar los recursos reservados
@@ -2459,22 +2649,6 @@ def check_operation_status(operation_id):
 def operation_callback():
     """
     Endpoint para recibir notificaciones del Queue Manager sobre el resultado de operaciones.
-    Este endpoint es llamado por el Queue Manager cuando una operación termina (éxito o fallo).
-
-    Request body:
-    {
-        "operationId": int,
-        "operationType": str,
-        "userId": int,
-        "status": str, # "SUCCESS" o "FAILED"
-        "result": {...}, # en caso de éxito
-        "error": str  # en caso de fallo
-    }
-
-    Returns:
-        200: Callback procesado correctamente
-        400: Request incompleto o inválido
-        500: Error interno
     """
     try:
         Logger.major_section("API: OPERATION CALLBACK")
@@ -2506,7 +2680,9 @@ def operation_callback():
             }), 400
 
         # Procesar según el tipo de operación y estado
-        if operation_type == "DEPLOY_SLICE" and status == "SUCCESS":
+        if operation_type == "DEPLOY_SLICE" and status == "COMPLETED":
+            Logger.info("Procesando despliegue exitoso...")
+
             # Procesar despliegue exitoso
             result = request_data.get('result', {})
             if not result:
@@ -2517,22 +2693,81 @@ def operation_callback():
                     "details": "No se proporcionaron datos del slice desplegado"
                 }), 400
 
-            # Procesar y guardar datos del slice desplegado con transacción
-            return process_deploy_slice_success_with_transaction(result, user_id)
+            # Emitir notificación WebSocket antes de procesar
+            Logger.info(f"Emitiendo notificación de progreso a usuario {user_id}")
+            emit_to_user(user_id, 'operation_update', {
+                'operation_id': operation_id,
+                'operation_type': operation_type,
+                'status': 'PROCESSING',
+                'message': 'Finalizando despliegue...'
+            })
+
+            # IMPORTANTE: Procesar y guardar datos del slice desplegado
+            Logger.info("Llamando a process_deploy_slice_success_with_transaction...")
+            try:
+                response = process_deploy_slice_success_with_transaction(result, user_id)
+                Logger.info(f"Respuesta de process_deploy_slice_success_with_transaction: {response}")
+
+                # Verificar si la respuesta fue exitosa
+                if response[1] == 200:  # response es una tupla (jsonify(...), status_code)
+                    Logger.success("Slice guardada exitosamente en BD")
+
+                    # Emitir notificación de éxito
+                    emit_to_user(user_id, 'operation_completed', {
+                        'operation_id': operation_id,
+                        'operation_type': operation_type,
+                        'status': 'SUCCESS',
+                        'message': 'Slice desplegada exitosamente',
+                        'result': result
+                    })
+
+                    return response
+                else:
+                    Logger.error(f"Error guardando slice en BD: {response}")
+                    raise Exception(f"Error en base de datos: {response[0]}")
+
+            except Exception as e:
+                Logger.error(f"Error en process_deploy_slice_success_with_transaction: {str(e)}")
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+                # Emitir notificación de error
+                emit_to_user(user_id, 'operation_failed', {
+                    'operation_id': operation_id,
+                    'operation_type': operation_type,
+                    'status': 'FAILED',
+                    'message': f'Error procesando resultado: {str(e)}'
+                })
+
+                return jsonify({
+                    "status": "error",
+                    "message": "Error procesando resultado del despliegue",
+                    "details": str(e)
+                }), 500
 
         elif operation_type == "DEPLOY_SLICE" and status == "FAILED":
+            Logger.warning("Procesando fallo de despliegue...")
+
             # Procesar fallo de despliegue
             error_message = request_data.get('error', "Error desconocido")
-            return process_deploy_slice_failure_with_cleanup(operation_id, erfror_message, user_id,
+
+            # Emitir notificación WebSocket de fallo
+            emit_to_user(user_id, 'operation_failed', {
+                'operation_id': operation_id,
+                'operation_type': operation_type,
+                'status': 'FAILED',
+                'message': 'Error en el despliegue',
+                'error': error_message
+            })
+
+            return process_deploy_slice_failure_with_cleanup(operation_id, error_message, user_id,
                                                              request_data.get('payload', {}))
 
-        # Para otros tipos de operación, implementar según sea necesario...
-        # Por ahora solo manejamos DEPLOY_SLICE
-
+        # Para otros tipos de operación
+        Logger.info(f"Operación {operation_type} con status {status} - no requiere procesamiento especial")
         return jsonify({
             "status": "success",
             "message": "Callback procesado",
-            "details": "Tipo de operación no implementado específicamente"
+            "details": f"Operación {operation_type} procesada"
         }), 200
 
     except Exception as e:
@@ -2544,6 +2779,61 @@ def operation_callback():
             "details": str(e)
         }), 500
 
+@app.route('/operation-progress', methods=['POST'])
+def operation_progress():
+    """
+    Endpoint para recibir actualizaciones de progreso de operaciones.
+    """
+    try:
+        Logger.major_section("API: OPERATION PROGRESS")
+
+        # Validar request
+        request_data = request.get_json()
+        if not request_data:
+            Logger.error("No se recibieron datos JSON")
+            return jsonify({
+                "status": "error",
+                "message": "No se recibieron datos JSON"
+            }), 400
+
+        Logger.debug(f"Datos de progreso: {json.dumps(request_data, indent=2)}")
+
+        # Extraer información
+        operation_id = request_data.get('operationId')
+        operation_type = request_data.get('operationType')
+        user_id = request_data.get('userId')
+        status = request_data.get('status')
+        message = request_data.get('message')
+
+        if not all([operation_id, operation_type, user_id, status]):
+            Logger.error("Faltan campos requeridos en el progreso")
+            return jsonify({
+                "status": "error",
+                "message": "Datos de progreso incompletos"
+            }), 400
+
+        # Emitir notificación WebSocket de progreso
+        Logger.info(f"Emitiendo progreso a usuario {user_id}")
+        emit_to_user(user_id, 'operation_update', {
+            'operation_id': operation_id,
+            'operation_type': operation_type,
+            'status': status,
+            'message': message or f'Operación en progreso...'
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": "Progreso notificado"
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error procesando progreso: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error procesando progreso",
+            "details": str(e)
+        }), 500
 
 def process_deploy_slice_success_with_transaction(deployed_data, user_id):
     """
@@ -2562,21 +2852,23 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
         Logger.section("PROCESANDO DESPLIEGUE EXITOSO CON TRANSACCIÓN")
         Logger.debug(f"Datos recibidos: {json.dumps(deployed_data, indent=2)}")
 
-        # Verificar datos
-        if not deployed_data.get('content'):
-            raise ValueError("Faltan datos en el resultado ('content')")
+        # CORREGIR: Los datos vienen directamente, no en 'content'
+        if not deployed_data:
+            raise ValueError("No se recibieron datos del slice desplegado")
 
-        # Extraer configuración
-        deployed_config = deployed_data.get('content')
+        # Extraer configuración directamente
+        deployed_config = deployed_data  # Los datos vienen directamente
         slice_id = deployed_config['slice_info']['id']
         network_config = deployed_config['network_config']
+
+        Logger.info(f"Procesando slice ID: {slice_id}")
 
         # Iniciar transacción
         conn, cursor = db.start_transaction()
 
         # Bloquear slice para actualización
         cursor.execute("SELECT id FROM slice WHERE id = %s FOR UPDATE", (slice_id,))
-        result = cursor.fetchall()  # Consumir TODOS los resultados
+        result = cursor.fetchall()
         if not result:
             Logger.warning(f"Slice ID-{slice_id} no encontrada, puede haber sido limpiada")
             conn.rollback()
@@ -2600,6 +2892,7 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                 slice_id
             )
         )
+        Logger.debug(f"Slice ID-{slice_id} actualizada")
 
         # Verificar si existe entrada en slice_network
         cursor.execute(
@@ -2608,7 +2901,7 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                WHERE slice_id = %s""",
             (slice_id,)
         )
-        slice_network_exists = cursor.fetchall()  # Consumir resultados
+        slice_network_exists = cursor.fetchall()
 
         # Crear o actualizar entrada en slice_network
         if not slice_network_exists:
@@ -2660,8 +2953,6 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                 )
             )
 
-        Logger.debug(f"Información de slice_network actualizada para Slice ID-{slice_id}")
-
         # Actualizar VMs
         for vm in deployed_config['topology_info']['vms']:
             cursor.execute(
@@ -2683,7 +2974,7 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                  AND slice = %s""",
             (user_id, slice_id)
         )
-        property_exists = cursor.fetchall()  # Importante: consumir resultados
+        property_exists = cursor.fetchall()
 
         # Crear entrada en property si no existe
         if not property_exists:
@@ -2695,7 +2986,6 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                 )
                 Logger.debug(f"Entrada creada en property: User ID-{user_id}, Slice ID-{slice_id}")
             except mysql.connector.errors.IntegrityError as e:
-                # Si hay error de duplicado, ignorarlo (ya existe)
                 if e.errno == 1062:  # Duplicate entry error
                     Logger.debug(f"Entrada ya existente en property: User ID-{user_id}, Slice ID-{slice_id}")
                 else:
@@ -2725,14 +3015,12 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
         cursor.execute(
             """SELECT user
                FROM resource
-               WHERE user = %s
-                   FOR UPDATE""",
+               WHERE user = %s FOR UPDATE""",
             (user_id,)
         )
-        resource_exists = cursor.fetchall()  # Consumir resultados
+        resource_exists = cursor.fetchall()
 
         if not resource_exists:
-            # Si no existe recurso para el usuario, crear uno
             Logger.warning(f"No se encontró registro de recursos para usuario {user_id}")
             cursor.execute(
                 """INSERT INTO resource (user, vcpus, ram, disk, slices,
@@ -2741,7 +3029,6 @@ def process_deploy_slice_success_with_transaction(deployed_data, user_id):
                 (user_id, required_vcpus, required_ram, required_disk)
             )
         else:
-            # Actualizar recursos
             cursor.execute(
                 """UPDATE resource
                    SET used_vcpus  = used_vcpus + %s,
@@ -2811,8 +3098,12 @@ def process_deploy_slice_failure_with_cleanup(operation_id, error_message, user_
         # Intentar extraer ID de slice del payload
         slice_id = None
         try:
+            # CORREGIR: Los datos vienen directamente en payload, no en payload['content']
             if payload and 'slice_info' in payload:
                 slice_id = payload['slice_info'].get('id')
+            # Si no está en slice_info, buscar en la estructura de result (del callback)
+            elif payload and 'result' in payload and 'slice_info' in payload['result']:
+                slice_id = payload['result']['slice_info'].get('id')
         except:
             Logger.warning("No se pudo obtener ID de slice del payload")
 
@@ -2820,7 +3111,6 @@ def process_deploy_slice_failure_with_cleanup(operation_id, error_message, user_
         if slice_id:
             Logger.warning(f"Limpiando recursos reservados para slice ID-{slice_id}")
             cleanup_reserved_resources(slice_id)
-
 
         return jsonify({
             "status": "success",
@@ -6654,11 +6944,11 @@ if __name__ == '__main__':
         
 
         # Iniciar servidor Flask
-        app.run(
+        socketio.run(
+            app,
             host=host,
             port=port,
-            debug=debug,
-            threaded=True
+            debug=debug
         )
 
     except Exception as e:

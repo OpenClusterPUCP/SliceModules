@@ -71,6 +71,17 @@ import secrets
 import select
 from typing import Tuple, List, Dict
 
+# Kafka y MySQL
+from confluent_kafka import Consumer, KafkaError, KafkaException
+import mysql.connector
+import mysql.connector.pooling
+from typing import List, Dict, Tuple
+import threading
+import uuid
+import queue
+import json
+import time
+from datetime import datetime
 
 # ===================== CONFIGURACIÓN DE FLASK =====================
 app = Flask(__name__, static_url_path='/static', static_folder='static')
@@ -82,13 +93,13 @@ port = 5000
 debug = True
 
 # ===================== CONFIGURACIÓN DE EUREKA =====================
-eureka_server = "http://localhost:8761"
+eureka_server = "http://10.0.10.1:8761"
 
 eureka_client.init(
     eureka_server=eureka_server,
     app_name="linux-driver",
     instance_port=5000,
-    instance_host="localhost",    
+    instance_host="10.0.10.1",
     renewal_interval_in_secs=30,
     duration_in_secs=90,
 )
@@ -180,6 +191,71 @@ NETWORK_CONFIG = {
     'internet_interface': 'ens3',
     'headnode_br': 'br-int',
 }
+
+# ===================== LOCKS PARA SINCRONIZACIÓN =====================
+# Lock global para operaciones de red (evita conflictos en configuración de bridges/namespace)
+network_setup_lock = threading.RLock()
+
+# Lock para operaciones de limpieza
+cleanup_lock = threading.RLock()
+
+# Lock para operaciones en OVS (evita comandos ovs-vsctl simultáneos)
+ovs_lock = threading.RLock()
+
+# ===================== CONFIGURACIÓN BD =====================
+DB_CONFIG = {
+    "host": "10.0.10.4",
+    "user": "root",
+    "password": "Branko",
+    "port": 4000,
+    "database": "cloud_v3"
+}
+
+POOL_CONFIG = {
+    "pool_name": "cloudpool",
+    "pool_size": 5,
+    **DB_CONFIG
+}
+
+# ===================== CONFIGURACIÓN DE KAFKA =====================
+KAFKA_CONFIG = {
+    'bootstrap.servers': 'localhost:9092',
+    'group.id': 'linux-driver',
+    'auto.offset.reset': 'earliest',
+    'enable.auto.commit': False,
+    'max.poll.interval.ms': 300000,  # 5 minutos
+    'session.timeout.ms': 30000,     # 30 segundos
+    'heartbeat.interval.ms': 10000,  # 10 segundos
+    #'max.poll.records': 1,           # Solo 1 mensaje por poll
+    'isolation.level': 'read_committed'
+}
+
+# Configuración de tópicos por prioridad (cada zona tendrá 3 tópicos)
+KAFKA_TOPICS = {
+    'HIGH': {
+        'name': 'linux-zone1-high',
+        'partitions': 8,
+        'worker_threads': 8
+    },
+    'MEDIUM': {
+        'name': 'linux-zone1-medium',
+        'partitions': 4,
+        'worker_threads': 4
+    },
+    'LOW': {
+        'name': 'linux-zone1-low',
+        'partitions': 2,
+        'worker_threads': 2
+    }
+}
+
+# Cola compartida de operaciones por SliceId para mantener orden FIFO
+slice_operation_queues = {}
+slice_operation_locks = {}
+slice_queue_lock = threading.RLock()
+
+# Estado global de consumidores
+consumers_running = True
 
 
 # ===================== UTILIDADES =====================
@@ -298,7 +374,7 @@ class Logger:
     @staticmethod
     def _get_timestamp():
         """Retorna el timestamp actual en formato legible"""
-        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def major_section(title):
@@ -640,6 +716,9 @@ class SliceManager:
             # 2. Configurar acceso a internet y DHCP
             current_stage = 'network'
             Logger.section("FASE 2: CONFIGURACIÓN DE RED")
+
+            # Inyectar slice_id en network_config para nombres únicos (AJUSTE PARA PARALELISMO)
+            slice_config['network_config']['slice_id'] = slice_config['slice_info']['id']
             self._setup_internet_access(slice_config['network_config'])
 
             # 3. Configuración paralela de workers
@@ -1261,115 +1340,149 @@ class SliceManager:
         
         Args:
             network_config (dict): Configuración de red con:
+                - slice_id: ID único del slice
                 - svlan_id: ID del SVLAN
                 - network: Red del slice (CIDR)
                 - dhcp_interface: Nombre interfaz DHCP
                 - gateway_interface: Nombre interfaz gateway
         """
-        Logger.section("CONFIGURANDO ACCESO A INTERNET")
-        
-        svlan = network_config['svlan_id']
-        network = network_config['network']
-        dhcp_if = network_config['dhcp_interface']
-        gateway_if = network_config['gateway_interface']
-        
-        Logger.info(f"SVLAN: {svlan}")
-        Logger.info(f"Red: {network}")
-        Logger.info(f"Interface DHCP: {dhcp_if}")
-        Logger.info(f"Interface Gateway: {gateway_if}")
+        # LOCK GLOBAL PARA EVITAR CONDICIONES DE CARRERA
+        with network_setup_lock:
+            Logger.section("CONFIGURANDO ACCESO A INTERNET")
 
-        # 1. Configurar namespace y veth pair
-        Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
-        os.system(f"ip netns add {NETWORK_CONFIG['dhcp_ns_name']} 2>/dev/null || true")
-        os.system("ip link add veth-int type veth peer name veth-ext 2>/dev/null || true")
-        os.system(f"ip link set veth-int netns {NETWORK_CONFIG['dhcp_ns_name']}")
-        
-        # 2. Configurar interfaces
-        Logger.subsection("CONFIGURANDO INTERFACES")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link set veth-int up")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link set lo up")
-        os.system("ip link set veth-ext up")
-        os.system(f"ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} veth-ext")
-        
-        # 3. Conectar a OVS y configurar gateway
-        Logger.subsection("CONFIGURANDO OVS Y GATEWAY")
-        os.system(f"ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
-        os.system(f"ovs-vsctl set interface {gateway_if} type=internal")
-        os.system(f"ovs-vsctl set port {gateway_if} tag={svlan}")
-        os.system(f"ip link set {gateway_if} up")
-        os.system(f"ip addr add {network.replace('0/24', '1/24')} dev {gateway_if}")
-        
-        # 4. Configurar VLAN subinterface
-        Logger.subsection("CONFIGURANDO VLAN SUBINTERFACE")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link add link veth-int name {dhcp_if} type vlan id {svlan}")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link set {dhcp_if} up")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip addr add {network.replace('0/24', '2/24')} dev {dhcp_if}")
-        
-        # 5. Configurar NAT
-        Logger.subsection("CONFIGURANDO NAT Y FORWARDING")
+            # Extraer información base
+            slice_id = network_config['slice_id']
+            svlan = network_config['svlan_id']
+            network = network_config['network']
+            gateway_if = network_config['gateway_interface']
 
-        # nat_commands = [
-        #     f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} iptables -t nat -A POSTROUTING -s {network} -j MASQUERADE",
-        #     f"sudo iptables -A FORWARD -s {network} -j ACCEPT",
-        #     f"sudo iptables -A FORWARD -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-        #     f"sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-        #     "sudo sysctl -w net.ipv4.ip_forward=1"
-        # ]
+            # Generar nombres únicos por slice
+            namespace_name = f"ns-slice-{slice_id}"
+            veth_int_name = f"veth-int-{slice_id}"
+            veth_ext_name = f"veth-ext-{slice_id}"
+            dhcp_if = f"veth-int.{svlan}"
 
-        nat_commands = [
-            f"iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-            f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
-            f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-            "sudo sysctl -w net.ipv4.ip_forward=1"
-        ]
+            Logger.info(f"Slice ID: {slice_id}")
+            Logger.info(f"SVLAN: {svlan}")
+            Logger.info(f"Red: {network}")
+            Logger.info(f"Namespace: {namespace_name}")
 
-        
-        for cmd in nat_commands:
-            Logger.debug(f"Ejecutando: {cmd}")
-            os.system(cmd)
+            try:
+                # 1. Verificar si namespace ya existe (evitar conflictos)
+                result = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
+                if namespace_name in result.stdout:
+                    Logger.warning(f"Namespace {namespace_name} ya existe, eliminando...")
+                    os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
 
-        # 6. Verificar estado
-        Logger.subsection("VERIFICANDO ESTADO FINAL")
-        Logger.debug("Estado de OVS:")
-        os.system("ovs-vsctl show")
-        Logger.debug(f"Estado de {gateway_if}:")
-        os.system(f"ip link show {gateway_if}")
-        Logger.debug("Estado de interfaces en namespace:")
-        os.system(f"ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link show")
+                # 2. Configurar namespace y veth pair únicos
+                Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
 
-        # 7. Configurar DHCP
-        Logger.subsection("CONFIGURANDO DHCP")
-        dhcp_config = self._generate_dhcp_config(network_config)
-        Logger.debug("Configuración DHCP generada:")
-        Logger.debug(dhcp_config)
-        self._apply_dhcp_config(dhcp_config, svlan)
+                # Eliminar interfaces existentes si existen
+                os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
 
-        Logger.success("Configuración de red completada exitosamente")
+                os.system(f"sudo ip netns add {namespace_name}")
+                os.system(f"sudo ip link add {veth_int_name} type veth peer name {veth_ext_name}")
+                os.system(f"sudo ip link set {veth_int_name} netns {namespace_name}")
+
+                # 3. Configurar interfaces
+                Logger.subsection("CONFIGURANDO INTERFACES")
+                os.system(f"sudo ip netns exec {namespace_name} ip link set {veth_int_name} up")
+                os.system(f"sudo ip netns exec {namespace_name} ip link set lo up")
+                os.system(f"sudo ip link set {veth_ext_name} up")
+
+                # Verificar que el bridge existe antes de agregar puerto
+                bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']],
+                                               capture_output=True)
+                if bridge_exists.returncode != 0:
+                    Logger.warning(f"Bridge {NETWORK_CONFIG['headnode_br']} no existe, creándolo...")
+                    os.system(f"sudo ovs-vsctl add-br {NETWORK_CONFIG['headnode_br']}")
+
+                os.system(f"sudo ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}")
+
+                # 4. Conectar a OVS y configurar gateway
+                Logger.subsection("CONFIGURANDO OVS Y GATEWAY")
+
+                # Eliminar puerto existente si existe
+                os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+
+                os.system(f"sudo ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+                os.system(f"sudo ovs-vsctl set interface {gateway_if} type=internal")
+                os.system(f"sudo ovs-vsctl set port {gateway_if} tag={svlan}")
+                os.system(f"sudo ip link set {gateway_if} up")
+
+                # Verificar si IP ya está asignada
+                ip_check = subprocess.run(['ip', 'addr', 'show', gateway_if], capture_output=True, text=True)
+                gateway_ip = network.replace('0/24', '1/24')
+                if gateway_ip.split('/')[0] not in ip_check.stdout:
+                    os.system(f"sudo ip addr add {gateway_ip} dev {gateway_if}")
+
+                # 5. Configurar VLAN subinterface dentro del namespace
+                Logger.subsection("CONFIGURANDO VLAN SUBINTERFACE")
+                os.system(
+                    f"sudo ip netns exec {namespace_name} ip link add link {veth_int_name} name {dhcp_if} type vlan id {svlan}")
+                os.system(f"sudo ip netns exec {namespace_name} ip link set {dhcp_if} up")
+                os.system(
+                    f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {dhcp_if}")
+
+                # 6. Configurar NAT (verificar existencia antes de agregar)
+                Logger.subsection("CONFIGURANDO NAT Y FORWARDING")
+                nat_commands = [
+                    f"sudo ip netns exec {namespace_name} iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo ip netns exec {namespace_name} iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                    f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+                    f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                    "sudo sysctl -w net.ipv4.ip_forward=1"
+                ]
+
+                for cmd in nat_commands:
+                    Logger.debug(f"Ejecutando: {cmd}")
+                    result = os.system(cmd)
+                    if result != 0:
+                        Logger.warning(f"Comando NAT falló: {cmd}")
+
+                # 7. Configurar DHCP
+                Logger.subsection("CONFIGURANDO DHCP")
+                dhcp_config = self._generate_dhcp_config(network_config, namespace_name)
+                self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
+
+                Logger.success("Configuración de red completada exitosamente")
+
+            except Exception as e:
+                Logger.error(f"Error en configuración de red: {str(e)}")
+                # Limpiar recursos parciales en caso de error
+                try:
+                    os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
+                    os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
+                    os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+                except:
+                    pass
+                raise
     
-    def _generate_dhcp_config(self, network_config: dict) -> str:
+    def _generate_dhcp_config(self, network_config: dict, namespace_name: str) -> str:
         """
         Genera la configuración del servidor DHCP para el slice.
         
         Args:
             network_config (dict): Configuración de red del slice
+            namespace_name (str): Nombre único del namespace para este slice
 
         Returns:
             str: Contenido del archivo de configuración DHCP
         """
         Logger.debug("Generando configuración DHCP")
-        
+
         network = network_config['network']
         svlan = network_config['svlan_id']
         range1 = network_config['dhcp_range'][0]
         range2 = network_config['dhcp_range'][1]
         dhcp_ip = network.replace('0/24', '2')
-        dhcp_if = network_config['dhcp_interface']
-        
-        # Definir rutas de archivos
+        dhcp_if = f"veth-int.{svlan}"
+
+        # Definir rutas de archivos únicos por slice
         log_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.log')
         lease_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.leases')
         pid_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.pid')
-        
+
+        Logger.debug(f"Namespace: {namespace_name}")
         Logger.debug(f"SVLAN: {svlan}")
         Logger.debug(f"Red: {network}")
         Logger.debug(f"Rango DHCP: {range1} - {range2}")
@@ -1380,22 +1493,22 @@ class SliceManager:
         config = [
             f"interface={dhcp_if}",
             f"listen-address={dhcp_ip}",
-                "bind-interfaces",
-                "except-interface=lo",
-                "no-hosts",
-                "no-resolv",
-                f"dhcp-range={range1},{range2},255.255.255.0,12h",
-                f"dhcp-option=3,{network.replace('0/24', '1')}",  # Router
-                "dhcp-option=1,255.255.255.0",  # Netmask
-                f"dhcp-option=28,{network.rsplit('.', 1)[0]}.255",  # Broadcast
-                "dhcp-option=6,8.8.8.8,8.8.4.4",  # DNS Servers
-                f"log-facility={log_file}",
-                f"pid-file={pid_file}",
-                "dhcp-authoritative",
-                f"dhcp-leasefile={lease_file}",
-                "log-queries",  # Para debug
-                "log-dhcp"     # Para debug
-            ]
+            "bind-interfaces",
+            "except-interface=lo",
+            "no-hosts",
+            "no-resolv",
+            f"dhcp-range={range1},{range2},255.255.255.0,12h",
+            f"dhcp-option=3,{network.replace('0/24', '1')}",  # Router
+            "dhcp-option=1,255.255.255.0",  # Netmask
+            f"dhcp-option=28,{network.rsplit('.', 1)[0]}.255",  # Broadcast
+            "dhcp-option=6,8.8.8.8,8.8.4.4",  # DNS Servers
+            f"log-facility={log_file}",
+            f"pid-file={pid_file}",
+            "dhcp-authoritative",
+            f"dhcp-leasefile={lease_file}",
+            "log-queries",  # Para debug
+            "log-dhcp"     # Para debug
+        ]
             
         # Unir configuración con saltos de línea
         final_config = '\n'.join(config)
@@ -1405,7 +1518,7 @@ class SliceManager:
         
         return final_config
 
-    def _apply_dhcp_config(self, config: str, svlan: int):
+    def _apply_dhcp_config(self, config: str, svlan: int, namespace_name: str):
         """
         Aplica la configuración DHCP generada.
         
@@ -1416,6 +1529,7 @@ class SliceManager:
         Args:
             config (str): Configuración DHCP a aplicar
             svlan (int): ID del SVLAN para nombrar archivos
+            namespace_name (str): Namespace donde ejecutar dnsmasq
             
         Raises:
             Exception: Si hay errores iniciando el servidor DHCP
@@ -1425,35 +1539,35 @@ class SliceManager:
         try:
             # Guardar config en archivo
             config_file = os.path.join(
-                DATA_DIR['dhcp']['config'], 
+                DATA_DIR['dhcp']['config'],
                 f'dnsmasq.{svlan}.conf'
             )
             Logger.info(f"Guardando configuración en {config_file}")
             
             with open(config_file, 'w') as f:
                 f.write(config)
-            
-            # Ejecutar dnsmasq
-            Logger.info("Iniciando servidor DHCP...")
+
+            # Ejecutar dnsmasq en el namespace específico del slice
+            Logger.info(f"Iniciando servidor DHCP en namespace {namespace_name}...")
             result = os.system(
-                f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} "
+                f"sudo ip netns exec {namespace_name} "
                 f"dnsmasq -C {config_file}"
             )
-            
+
             # Verificar resultado
             if result != 0:
                 # Verificar error específico
-                verify_cmd = (f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} "
-                            f"dnsmasq -C {config_file} 2>&1")
+                verify_cmd = (f"sudo ip netns exec {namespace_name} "
+                              f"dnsmasq -C {config_file} 2>&1")
                 output = subprocess.getoutput(verify_cmd)
-                
+
                 if "failed to create listening socket" in output and "Address already in use" in output:
-                    Logger.error("Puerto DHCP ya en uso")
+                    Logger.error("Puerto DHCP ya en uso en este namespace")
                     raise Exception("DHCP port already in use")
                 else:
                     Logger.error(f"Error iniciando servidor DHCP: {output}")
                     raise Exception(f"Failed to start DHCP server: {output}")
-                    
+
             Logger.success("Servidor DHCP iniciado exitosamente")
                 
         except Exception as e:
@@ -1669,13 +1783,19 @@ class SliceManager:
 
             # Limpieza en el HeadNode
 
-            #Configuración DHCP y de RED:
+            # Obtener información del slice
+            slice_id = slice_config['slice_info']['id'] if 'slice_config' in locals() else slice_id
             network_config = request_data['network_config']
             svlan = network_config['svlan_id']
             network = network_config['network']
             gateway_if = network_config['gateway_interface']
 
-            # Matar dnsmasq
+            # Generar nombres únicos del slice
+            namespace_name = f"ns-slice-{slice_id}"
+            veth_int_name = f"veth-int-{slice_id}"
+            veth_ext_name = f"veth-ext-{slice_id}"
+
+            # Matar dnsmasq específico del slice (SIN CAMBIOS)
             cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
             try:
                 pid = subprocess.check_output(cmd, shell=True).decode().strip()
@@ -1686,8 +1806,9 @@ class SliceManager:
                 Logger.debug("No se encontró proceso dnsmasq activo")
 
             # 1. Eliminar interfaces del bridge OVS
-            Logger.info("Eliminando interfaces del bridge OVS...")
+            Logger.info("Eliminando interfaces específicas del slice...")
             ovs_cleanup_commands = [
+                f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}",
                 f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}"
             ]
             for cmd in ovs_cleanup_commands:
@@ -1696,32 +1817,34 @@ class SliceManager:
             # 2. Eliminar interfaces del host
             Logger.info("Eliminando interfaces del host...")
             host_cleanup_commands = [
-                f"sudo ip link del {gateway_if} 2>/dev/null || true"
+                f"sudo ip link del {gateway_if} 2>/dev/null || true",
+                f"sudo ip link del {veth_ext_name} 2>/dev/null || true"
             ]
             for cmd in host_cleanup_commands:
                 os.system(cmd)
 
             # 3. Eliminar interfaces dentro del namespace
-            Logger.info("Eliminando interfaces del namespace...")
+            Logger.info(f"Eliminando namespace {namespace_name}...")
             ns_cleanup_commands = [
-                f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link del veth-int.{svlan} 2>/dev/null || true"
+                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
+                f"sudo ip netns del {namespace_name} 2>/dev/null || true"
             ]
             for cmd in ns_cleanup_commands:
                 os.system(cmd)
 
             # 4. Limpiar reglas de iptables y forwarding
-            Logger.info("Limpiando reglas de red...")
+            Logger.info("Limpiando reglas de red específicas...")
             cleanup_commands = [
-                f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-                f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
-                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || true",
+                f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || true",
+                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true",
                 "sudo sysctl -w net.ipv4.ip_forward=1"
             ]
             for cmd in cleanup_commands:
                 os.system(cmd)
 
             # 5. Limpiar configuración DHCP
-            Logger.info("Limpiando configuración DHCP...")
+            Logger.info("Limpiando configuración DHCP específica...")
             dhcp_config = os.path.join(DATA_DIR['dhcp']['config'], f'dnsmasq.{svlan}.conf')
             if os.path.exists(dhcp_config):
                 os.remove(dhcp_config)
@@ -2368,228 +2491,266 @@ class SliceManager:
         """
         Limpia los recursos creados durante un despliegue fallido.
         """
-        try:
-            Logger.section("INICIANDO LIMPIEZA DE RECURSOS") 
+        with cleanup_lock:
+            try:
+                Logger.section("INICIANDO LIMPIEZA DE RECURSOS")
 
-            # Obtener configuración necesaria
-            network_config = slice_config['network_config']
-            svlan = network_config['svlan_id']
-            network = network_config['network']
-            slice_bridge = network_config['slice_bridge_name']
-            patch_slice = network_config['patch_ports']['slice_side']
-            patch_int = network_config['patch_ports']['int_side']
-            dhcp_if = network_config['dhcp_interface']
-            gateway_if = network_config['gateway_interface']
+                # Obtener configuración necesaria
+                network_config = slice_config['network_config']
+                svlan = network_config['svlan_id']
+                network = network_config['network']
+                slice_bridge = network_config['slice_bridge_name']
+                patch_slice = network_config['patch_ports']['slice_side']
+                patch_int = network_config['patch_ports']['int_side']
+                dhcp_if = network_config['dhcp_interface']
+                gateway_if = network_config['gateway_interface']
 
-            # Orden de limpieza (de más crítico a menos crítico)
-            deployment_order = [
-                'worker_setup',   # Configuración completa
-                'images',         # Imágenes base
-                'network',        # Red y DHCP 
-                'init'           # VNC ports
-            ]
+                # Orden de limpieza (de más crítico a menos crítico)
+                deployment_order = [
+                    'worker_setup',   # Configuración completa
+                    'images',         # Imágenes base
+                    'network',        # Red y DHCP
+                    'init'           # VNC ports
+                ]
 
-            # Determinar etapas a limpiar
-            if current_stage:
-                try:
-                    start_index = deployment_order.index(current_stage)
-                    stages_to_clean = deployment_order[start_index:]  # Desde la etapa actual hasta el final
-                    Logger.info(f"Limpiando desde {current_stage} hasta init")
-                except ValueError:
-                    Logger.warning(f"Etapa '{current_stage}' no reconocida, limpiando todo")
-                    stages_to_clean = deployment_order
-            else:
-                stages_to_clean = deployment_order
-
-            Logger.info(f"Etapas a limpiar: {stages_to_clean}")
-
-            def clean_worker(worker_info: dict, vms: list, results: dict):
-                try:
-                    # Verificar worker_info
-                    if not isinstance(worker_info, dict):
-                        raise ValueError("Invalid worker_info format")
-
-                    worker_id = str(worker_info['id'])
-                    full_worker_info = slice_config['resources_info']['workers'].get(worker_id)
-                    if not full_worker_info:
-                        raise ValueError(f"Worker information not found for ID {worker_id}")
-
-                    # Crear SSH info
-                    ssh_info = {
-                        'name': full_worker_info['name'],
-                        'ip': full_worker_info['ip'],
-                        'ssh_username': full_worker_info['ssh_username'],
-                        'ssh_password': full_worker_info.get('ssh_password'),
-                        'ssh_key_path': full_worker_info.get('ssh_key_path')
-                    }
-
-                    with SSHManager(ssh_info) as ssh:
-                        # 1. Matar procesos QEMU
-                        for vm in vms:
-                            try:
-                                Logger.info(f"Matando proceso QEMU de VM ID-{vm['id']}...")
-                                ssh.execute(f"sudo pkill -9 -f 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}' 2>/dev/null || true")
-                            except Exception as e:
-                                Logger.warning(f"Error matando proceso de VM ID-{vm['id']}: {str(e)}")
-
-                        time.sleep(2)
-
-                        # 2. Limpiar imágenes
-                        try:
-                            Logger.info("Limpiando imágenes...")
-                            ssh.execute("sudo rm -f /home/ubuntu/SliceManager/images/vm-*-slice-*.qcow2")
-                        except Exception as e:
-                            Logger.warning(f"Error limpiando imágenes: {str(e)}")
-
-                        # 3. Limpiar interfaces y bridges
-                        cleanup_commands = []
-                        for vm in vms:
-                            vm_interfaces = [i for i in slice_config['topology_info']['interfaces'] 
-                                        if i['vm_id'] == vm['id']]
-                            
-                            for interface in vm_interfaces:
-                                tap_name = interface.get('tap_name')
-                                if tap_name:
-                                    if interface.get('external_access'):
-                                        cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port br-int {tap_name}")
-                                    else:
-                                        cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {tap_name}")
-                                    cleanup_commands.extend([
-                                        f"sudo ip link set {tap_name} down 2>/dev/null || true",
-                                        f"sudo ip tuntap del {tap_name} mode tap 2>/dev/null || true"
-                                    ])
-
-                        # 4. Limpiar bridges y patch ports
-                        cleanup_commands.extend([
-                            f"sudo ovs-vsctl --if-exists del-port br-int {patch_int}",
-                            f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {patch_slice}",
-                            f"sudo ovs-vsctl --if-exists del-br {slice_bridge}"
-                        ])
-
-                        # Ejecutar comandos
-                        if cleanup_commands:
-                            try:
-                                ssh.execute(" && ".join(cleanup_commands))
-                            except Exception as e:
-                                Logger.warning(f"Error en comandos de limpieza: {str(e)}")
-
-                        results[full_worker_info['name']] = {'success': True, 'error': None}
-
-                except Exception as e:
-                    worker_name = worker_info.get('name', 'unknown')
-                    results[worker_name] = {'success': False, 'error': str(e)}
-
-            # Procesar etapas de limpieza
-            for stage in stages_to_clean:
-                Logger.subsection(f"LIMPIANDO ETAPA: {stage}")
-
-                if stage == 'network' or stage == 'init':
-                    Logger.info("Limpiando configuración inicial de red y DHCP...")
+                # Determinar etapas a limpiar
+                if current_stage:
                     try:
-                        # Matar dnsmasq
-                        cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
-                        try:
-                            pid = subprocess.check_output(cmd, shell=True).decode().strip()
-                            if pid:
-                                Logger.info(f"Matando proceso dnsmasq (PID: {pid})")
-                                os.system(f"sudo kill -9 {pid}")
-                        except subprocess.CalledProcessError:
-                            Logger.debug("No se encontró proceso dnsmasq activo")
+                        start_index = deployment_order.index(current_stage)
+                        stages_to_clean = deployment_order[start_index:]  # Desde la etapa actual hasta el final
+                        Logger.info(f"Limpiando desde {current_stage} hasta init")
+                    except ValueError:
+                        Logger.warning(f"Etapa '{current_stage}' no reconocida, limpiando todo")
+                        stages_to_clean = deployment_order
+                else:
+                    stages_to_clean = deployment_order
 
-                        # 1. Eliminar interfaces del bridge OVS
-                        Logger.info("Eliminando interfaces del bridge OVS...")
-                        ovs_cleanup_commands = [
-                            f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}"
-                        ]
-                        for cmd in ovs_cleanup_commands:
-                            os.system(cmd)
+                Logger.info(f"Etapas a limpiar: {stages_to_clean}")
 
-                        # 2. Eliminar interfaces del host
-                        Logger.info("Eliminando interfaces del host...")
-                        host_cleanup_commands = [
-                            f"sudo ip link del {gateway_if} 2>/dev/null || true"
-                        ]
-                        for cmd in host_cleanup_commands:
-                            os.system(cmd)
+                def clean_worker(worker_info: dict, vms: list, results: dict):
+                    try:
+                        # Verificar worker_info
+                        if not isinstance(worker_info, dict):
+                            raise ValueError("Invalid worker_info format")
 
-                        # 3. Eliminar interfaces dentro del namespace
-                        Logger.info("Eliminando interfaces del namespace...")
-                        ns_cleanup_commands = [
-                            f"sudo ip netns exec {NETWORK_CONFIG['dhcp_ns_name']} ip link del veth-int.{svlan} 2>/dev/null || true"
-                        ]
-                        for cmd in ns_cleanup_commands:
-                            os.system(cmd)
+                        worker_id = str(worker_info['id'])
+                        full_worker_info = slice_config['resources_info']['workers'].get(worker_id)
+                        if not full_worker_info:
+                            raise ValueError(f"Worker information not found for ID {worker_id}")
 
-                        # 4. Limpiar reglas de iptables y forwarding
-                        Logger.info("Limpiando reglas de red...")
-                        cleanup_commands = [
-                            f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-                            f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
-                            f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-                            "sudo sysctl -w net.ipv4.ip_forward=1"
-                        ]
-                        for cmd in cleanup_commands:
-                            os.system(cmd)
+                        # Crear SSH info
+                        ssh_info = {
+                            'name': full_worker_info['name'],
+                            'ip': full_worker_info['ip'],
+                            'ssh_username': full_worker_info['ssh_username'],
+                            'ssh_password': full_worker_info.get('ssh_password'),
+                            'ssh_key_path': full_worker_info.get('ssh_key_path')
+                        }
 
-                        # 5. Limpiar configuración DHCP
-                        Logger.info("Limpiando configuración DHCP...")
-                        dhcp_config = os.path.join(DATA_DIR['dhcp']['config'], f'dnsmasq.{svlan}.conf')
-                        if os.path.exists(dhcp_config):
-                            os.remove(dhcp_config)
+                        with SSHManager(ssh_info) as ssh:
+                            # 1. Matar procesos QEMU
+                            for vm in vms:
+                                try:
+                                    Logger.info(f"Matando proceso QEMU de VM ID-{vm['id']}...")
+                                    # Verificar si el proceso existe antes de matarlo
+                                    check_cmd = f"pgrep -f 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
+                                    try:
+                                        stdout, _ = ssh.execute(check_cmd)
+                                        if stdout.strip():
+                                            # Proceso existe, matarlo
+                                            pids = stdout.strip().split('\n')
+                                            for pid in pids:
+                                                ssh.execute(f"sudo kill -9 {pid}")
+                                            Logger.debug(f"Procesos QEMU eliminados: {pids}")
+                                        else:
+                                            Logger.debug(f"No se encontraron procesos QEMU para VM ID-{vm['id']}")
+                                    except Exception as inner_e:
+                                        # Si falla la verificación, intentar pkill de todas formas
+                                        ssh.execute(
+                                            f"sudo pkill -9 -f 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}' 2>/dev/null || true")
+                                except Exception as e:
+                                    # Solo loggear como warning si es un error real
+                                    if "status=-1" not in str(e) and "No such process" not in str(e):
+                                        Logger.warning(f"Error matando proceso de VM ID-{vm['id']}: {str(e)}")
+                                    else:
+                                        Logger.debug(f"VM ID-{vm['id']} no tenía proceso corriendo")
+
+                            time.sleep(2)
+
+                            # 2. Limpiar imágenes
+                            try:
+                                Logger.info("Limpiando imágenes...")
+                                ssh.execute("sudo rm -f /home/ubuntu/SliceManager/images/vm-*-slice-*.qcow2")
+                            except Exception as e:
+                                Logger.warning(f"Error limpiando imágenes: {str(e)}")
+
+                            # 3. Limpiar interfaces y bridges
+                            cleanup_commands = []
+                            for vm in vms:
+                                vm_interfaces = [i for i in slice_config['topology_info']['interfaces']
+                                            if i['vm_id'] == vm['id']]
+
+                                for interface in vm_interfaces:
+                                    tap_name = interface.get('tap_name')
+                                    if tap_name:
+                                        if interface.get('external_access'):
+                                            cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port br-int {tap_name}")
+                                        else:
+                                            cleanup_commands.append(f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {tap_name}")
+                                        cleanup_commands.extend([
+                                            f"sudo ip link set {tap_name} down 2>/dev/null || true",
+                                            f"sudo ip tuntap del {tap_name} mode tap 2>/dev/null || true"
+                                        ])
+
+                            # 4. Limpiar bridges y patch ports
+                            cleanup_commands.extend([
+                                f"sudo ovs-vsctl --if-exists del-port br-int {patch_int}",
+                                f"sudo ovs-vsctl --if-exists del-port {slice_bridge} {patch_slice}",
+                                f"sudo ovs-vsctl --if-exists del-br {slice_bridge}"
+                            ])
+
+                            # Ejecutar comandos
+                            if cleanup_commands:
+                                try:
+                                    ssh.execute(" && ".join(cleanup_commands))
+                                except Exception as e:
+                                    Logger.warning(f"Error en comandos de limpieza: {str(e)}")
+
+                            results[full_worker_info['name']] = {'success': True, 'error': None}
 
                     except Exception as e:
-                        Logger.error(f"Error limpiando red: {str(e)}")
+                        worker_name = worker_info.get('name', 'unknown')
+                        results[worker_name] = {'success': False, 'error': str(e)}
 
-                elif stage in ['images', 'worker_setup']:
-                    Logger.info("Limpiando workers en paralelo...")
-                    # Agrupar VMs por worker
-                    vms_by_worker = {}
-                    for vm in slice_config['topology_info']['vms']:
-                        worker_id = str(vm['physical_server']['id'])
-                        worker_info = slice_config['resources_info']['workers'][worker_id]
-                        if worker_info['name'] not in vms_by_worker:
-                            vms_by_worker[worker_info['name']] = {
-                                'info': worker_info,
-                                'vms': []
-                            }
-                        vms_by_worker[worker_info['name']]['vms'].append(vm)
+                # Procesar etapas de limpieza
+                for stage in stages_to_clean:
+                    Logger.subsection(f"LIMPIANDO ETAPA: {stage}")
 
-                    # Limpiar workers en paralelo
-                    threads = []
-                    worker_results = {}
+                    if stage == 'network' or stage == 'init':
+                        Logger.info("Limpiando configuración inicial de red y DHCP...")
+                        try:
+                            # Obtener identificadores únicos del slice
+                            slice_id = slice_config['slice_info']['id']
+                            namespace_name = f"ns-slice-{slice_id}"
+                            veth_int_name = f"veth-int-{slice_id}"
+                            veth_ext_name = f"veth-ext-{slice_id}"
 
-                    for worker_name, worker_data in vms_by_worker.items():
-                        thread = threading.Thread(
-                            target=clean_worker,
-                            args=(worker_data['info'], worker_data['vms'], worker_results)
-                        )
-                        threads.append(thread)
-                        thread.start()
+                            # Matar dnsmasq específico del slice
+                            cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
+                            try:
+                                pid = subprocess.check_output(cmd, shell=True).decode().strip()
+                                if pid:
+                                    Logger.info(f"Matando proceso dnsmasq (PID: {pid})")
+                                    os.system(f"sudo kill -9 {pid}")
+                            except subprocess.CalledProcessError:
+                                Logger.debug("No se encontró proceso dnsmasq activo")
 
-                    # Esperar threads y verificar resultados
-                    for thread in threads:
-                        thread.join()
+                            # Eliminar interfaces específicas del slice
+                            Logger.info("Eliminando interfaces específicas del slice...")
+                            ovs_cleanup_commands = [
+                                f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}",
+                                f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}"
+                            ]
+                            for cmd in ovs_cleanup_commands:
+                                os.system(cmd)
 
-                    failed_workers = [
-                        worker for worker, result in worker_results.items()
-                        if not result['success']
-                    ]
+                            # Limpiar namespace específico del slice
+                            Logger.info(f"Eliminando namespace {namespace_name}...")
+                            ns_cleanup_commands = [
+                                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
+                                f"sudo ip netns del {namespace_name} 2>/dev/null || true"
+                            ]
+                            for cmd in ns_cleanup_commands:
+                                os.system(cmd)
 
-                    if failed_workers:
-                        error_messages = [
-                            f"{worker}: {worker_results[worker]['error']}"
-                            for worker in failed_workers  
+                            # Eliminar interfaces del host
+                            Logger.info("Eliminando interfaces del host...")
+                            host_cleanup_commands = [
+                                f"sudo ip link del {gateway_if} 2>/dev/null || true",
+                                f"sudo ip link del {veth_ext_name} 2>/dev/null || true"
+                            ]
+                            for cmd in host_cleanup_commands:
+                                os.system(cmd)
+
+                            # Limpiar namespace específico del slice
+                            Logger.info(f"Eliminando namespace {namespace_name}...")
+                            ns_cleanup_commands = [
+                                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
+                                f"sudo ip netns del {namespace_name} 2>/dev/null || true"
+                            ]
+                            for cmd in ns_cleanup_commands:
+                                os.system(cmd)
+
+                            # Limpiar reglas de iptables y forwarding específicas del slice
+                            Logger.info("Limpiando reglas de red específicas...")
+                            cleanup_commands = [
+                                f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || true",
+                                f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || true",
+                                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true",
+                                "sudo sysctl -w net.ipv4.ip_forward=1"
+                            ]
+                            for cmd in cleanup_commands:
+                                os.system(cmd)
+
+                            # Limpiar configuración DHCP específica del slice
+                            Logger.info("Limpieza final de configuración DHCP...")
+                            dhcp_config = os.path.join(DATA_DIR['dhcp']['config'], f'dnsmasq.{svlan}.conf')
+                            if os.path.exists(dhcp_config):
+                                os.remove(dhcp_config)
+
+                        except Exception as e:
+                            Logger.error(f"Error limpiando red: {str(e)}")
+
+                    elif stage in ['images', 'worker_setup']:
+                        Logger.info("Limpiando workers en paralelo...")
+                        # Agrupar VMs por worker
+                        vms_by_worker = {}
+                        for vm in slice_config['topology_info']['vms']:
+                            worker_id = str(vm['physical_server']['id'])
+                            worker_info = slice_config['resources_info']['workers'][worker_id]
+                            if worker_info['name'] not in vms_by_worker:
+                                vms_by_worker[worker_info['name']] = {
+                                    'info': worker_info,
+                                    'vms': []
+                                }
+                            vms_by_worker[worker_info['name']]['vms'].append(vm)
+
+                        # Limpiar workers en paralelo
+                        threads = []
+                        worker_results = {}
+
+                        for worker_name, worker_data in vms_by_worker.items():
+                            thread = threading.Thread(
+                                target=clean_worker,
+                                args=(worker_data['info'], worker_data['vms'], worker_results)
+                            )
+                            threads.append(thread)
+                            thread.start()
+
+                        # Esperar threads y verificar resultados
+                        for thread in threads:
+                            thread.join()
+
+                        failed_workers = [
+                            worker for worker, result in worker_results.items()
+                            if not result['success']
                         ]
-                        Logger.error("Errores durante la limpieza:")
-                        for error in error_messages:
-                            Logger.error(f"  - {error}")
 
-            Logger.success(f"Limpieza completada para slice {slice_config['slice_info']['id']}")
+                        if failed_workers:
+                            error_messages = [
+                                f"{worker}: {worker_results[worker]['error']}"
+                                for worker in failed_workers
+                            ]
+                            Logger.error("Errores durante la limpieza:")
+                            for error in error_messages:
+                                Logger.error(f"  - {error}")
 
-        except Exception as e:
-            Logger.error(f"Error durante limpieza: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            raise
+                Logger.success(f"Limpieza completada para slice {slice_config['slice_info']['id']}")
+
+            except Exception as e:
+                Logger.error(f"Error durante limpieza: {str(e)}")
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+                raise
 
 class ImageManager:
     """
@@ -2839,6 +3000,957 @@ class ImageManager:
         
         return results
 
+class DatabaseManager:
+    """
+    Gestor de conexiones y operaciones con la base de datos MySQL.
+
+    Esta clase maneja un pool de conexiones y proporciona métodos para:
+    - Ejecutar queries individuales
+    - Ejecutar transacciones con múltiples queries
+    - Obtener resultados en formato de diccionario
+
+    Atributos:
+        cnx_pool: Pool de conexiones MySQL configurado con POOL_CONFIG
+    """
+
+    def __init__(self):
+        """
+        Inicializa el gestor creando el pool de conexiones MySQL.
+        """
+        Logger.info("Iniciando DatabaseManager")
+        try:
+            self.cnx_pool = mysql.connector.pooling.MySQLConnectionPool(**POOL_CONFIG)
+            Logger.success("Pool de conexiones MySQL creado exitosamente")
+            Logger.debug(f"Configuración del pool: {POOL_CONFIG}")
+        except Exception as e:
+            Logger.error(f"Error creando pool de conexiones: {str(e)}")
+            raise
+
+    def get_connection(self):
+        """
+        Obtiene una conexión del pool.
+
+        Returns:
+            MySQLConnection: Una conexión activa del pool
+
+        Raises:
+            PoolError: Si no hay conexiones disponibles en el pool
+        """
+        try:
+            conn = self.cnx_pool.get_connection()
+            Logger.debug("Conexión obtenida del pool")
+            return conn
+        except Exception as e:
+            Logger.error(f"Error obteniendo conexión del pool: {str(e)}")
+            raise
+
+    def execute_query(self, query: str, params: tuple = None) -> List[Dict]:
+        """
+        Ejecuta una query SQL y retorna los resultados.
+
+        Args:
+            query (str): Query SQL a ejecutar
+            params (tuple, optional): Parámetros para la query
+
+        Returns:
+            List[Dict]: Lista de resultados donde cada fila es un diccionario
+
+        Raises:
+            Exception: Si hay error ejecutando la query
+        """
+        connection = None
+        cursor = None
+        try:
+            Logger.debug(f"Ejecutando query: {query.strip()}")
+            if params:
+                Logger.debug(f"Parámetros: {params}")
+
+            connection = self.get_connection()
+            cursor = connection.cursor(dictionary=True)
+
+            cursor.execute(query, params)
+
+            if cursor.with_rows:
+                results = cursor.fetchall()
+                Logger.debug(f"Filas obtenidas: {len(results)}")
+                return results
+            else:
+                # Para queries de UPDATE/INSERT, verificar cantidad de filas afectadas
+                affected_rows = cursor.rowcount
+                Logger.debug(f"Query ejecutada sin resultados, filas afectadas: {affected_rows}")
+
+                # Hacer commit explícito para queries de modificación
+                connection.commit()
+
+                return []
+
+        except mysql.connector.Error as e:
+            Logger.error(f"Error de MySQL ejecutando query: {str(e)}")
+            Logger.error(f"Código de error: {e.errno}")
+            Logger.error(f"Mensaje SQL: {e.msg}")
+            Logger.debug(f"Query: {query}")
+            Logger.debug(f"Parámetros: {params}")
+
+            # Hacer rollback en caso de error
+            if connection:
+                connection.rollback()
+            raise
+
+        except Exception as e:
+            Logger.error(f"Error general ejecutando query: {str(e)}")
+            Logger.debug(f"Query: {query}")
+            Logger.debug(f"Parámetros: {params}")
+
+            # Hacer rollback en caso de error
+            if connection:
+                connection.rollback()
+            raise
+
+        finally:
+            # Cerrar cursor y conexión
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def execute_transaction(self, queries: List[Tuple[str, tuple]]) -> bool:
+        """
+        Ejecuta múltiples queries en una transacción atómica.
+
+        Args:
+            queries (List[Tuple[str, tuple]]): Lista de tuplas (query, params)
+
+        Returns:
+            bool: True si la transacción fue exitosa
+
+        Raises:
+            Exception: Si hay error en la transacción (se hace rollback)
+        """
+        try:
+            Logger.debug(f"Iniciando transacción con {len(queries)} queries")
+
+            with self.get_connection() as cnx:
+                with cnx.cursor() as cursor:
+                    for i, (query, params) in enumerate(queries, 1):
+                        Logger.debug(f"Ejecutando query {i}/{len(queries)}")
+                        Logger.debug(f"Query: {query}")
+                        Logger.debug(f"Parámetros: {params}")
+                        cursor.execute(query, params)
+
+                Logger.debug("Haciendo commit de la transacción")
+                cnx.commit()
+                Logger.success("Transacción completada exitosamente")
+                return True
+
+        except Exception as e:
+            Logger.error(f"Error en transacción: {str(e)}")
+            Logger.warning("Ejecutando rollback")
+            if 'cnx' in locals():
+                cnx.rollback()
+            raise
+
+class KafkaProcessor:
+    """
+    Procesador de mensajes Kafka para operaciones del Linux Driver.
+
+    Maneja:
+    - Consumo de múltiples tópicos con prioridades
+    - Procesamiento paralelo por partición
+    - Garantía de orden FIFO por SliceId
+    - Manejo de errores y reintentos
+    - Notificación de estado de operaciones
+
+    Attributes:
+        slice_manager: Instancia de SliceManager
+        db_manager: Instancia de DatabaseManager
+        consumers: Diccionario de consumidores por prioridad
+        worker_threads: Diccionario de hilos trabajadores
+    """
+
+    def __init__(self):
+        Logger.major_section("INICIANDO PROCESADOR KAFKA")
+        self.slice_manager = SliceManager()
+        self.db_manager = DatabaseManager()
+        self.consumers = {}
+        self.worker_threads = {}
+        self.topic_partitions = {}
+        self.message_queues = {}
+        self.exit_flag = threading.Event()
+
+        # Lock para operaciones de BD
+        self.db_lock = threading.RLock()
+
+        # Set para tracking de mensajes procesados (evitar duplicados)
+        self.processed_messages = set()
+        self.processed_lock = threading.RLock()
+
+        self._init_db()
+        Logger.success("Procesador Kafka inicializado")
+
+    def _init_db(self):
+        """Verifica la conexión a la base de datos y la disponibilidad de las tablas."""
+        try:
+            Logger.info("Verificando conexión a la base de datos...")
+
+            # Verificar que podemos acceder a la tabla operation_requests
+            check_query = """
+                          SELECT COUNT(*) as count
+                          FROM information_schema.tables
+                          WHERE table_schema = %s
+                            AND table_name IN ('operation_requests', 'queue_metrics')
+                          """
+
+            results = self.db_manager.execute_query(check_query, (DB_CONFIG['database'],))
+
+            if results and results[0]['count'] == 2:
+                Logger.success("Tablas operation_requests y queue_metrics verificadas correctamente")
+            else:
+                Logger.warning("No se encontraron todas las tablas necesarias en la base de datos")
+                Logger.debug(f"Resultado de verificación: {results}")
+
+            # Actualizar métricas iniciales
+            self._update_queue_metrics()
+
+        except Exception as e:
+            Logger.error(f"Error verificando base de datos: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def start(self):
+        """
+        Inicia los consumidores Kafka y los hilos trabajadores.
+        """
+        try:
+            Logger.section("INICIANDO CONSUMIDORES KAFKA")
+
+            # Iniciar consumidores por prioridad
+            for priority, config in KAFKA_TOPICS.items():
+                Logger.info(f"Iniciando consumidor para tópico {config['name']} ({priority})")
+
+                # Crear colas para cada partición
+                self.message_queues[priority] = [queue.Queue() for _ in range(config['partitions'])]
+
+                # Iniciar consumidor
+                consumer_thread = threading.Thread(
+                    target=self._consumer_thread,
+                    args=(priority, config),
+                    name=f"kafka-consumer-{priority.lower()}"
+                )
+                consumer_thread.daemon = True
+                consumer_thread.start()
+                self.consumers[priority] = consumer_thread
+
+                # Iniciar trabajadores para cada partición
+                self.worker_threads[priority] = []
+                for partition in range(config['partitions']):
+                    worker_thread = threading.Thread(
+                        target=self._worker_thread,
+                        args=(priority, partition, self.message_queues[priority][partition]),
+                        name=f"worker-{priority.lower()}-p{partition}"
+                    )
+                    worker_thread.daemon = True
+                    worker_thread.start()
+                    self.worker_threads[priority].append(worker_thread)
+
+                Logger.success(f"Consumidor {priority} iniciado con {config['partitions']} particiones")
+
+            Logger.success("Todos los consumidores Kafka iniciados correctamente")
+
+        except Exception as e:
+            Logger.error(f"Error iniciando consumidores Kafka: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def stop(self):
+        """
+        Detiene consumidores y trabajadores de forma segura.
+        """
+        try:
+            Logger.section("DETENIENDO PROCESADOR KAFKA")
+
+            # Señalizar a los hilos que deben detenerse
+            self.exit_flag.set()
+
+            # Esperar a que terminen los hilos (timeout)
+            timeout = 30  # segundos
+            Logger.info(f"Esperando hasta {timeout} segundos para cierre ordenado...")
+
+            for priority, threads in self.worker_threads.items():
+                for idx, thread in enumerate(threads):
+                    thread.join(timeout / len(threads))
+                    if thread.is_alive():
+                        Logger.warning(f"Trabajador {priority}-{idx} no finalizó a tiempo")
+
+            for priority, thread in self.consumers.items():
+                thread.join(timeout / len(self.consumers))
+                if thread.is_alive():
+                    Logger.warning(f"Consumidor {priority} no finalizó a tiempo")
+
+            Logger.success("Procesador Kafka detenido")
+
+        except Exception as e:
+            Logger.error(f"Error deteniendo procesador Kafka: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+    def _consumer_thread(self, priority, config):
+        """
+        Hilo de consumidor Kafka para un tópico específico.
+
+        Args:
+            priority: Nivel de prioridad (HIGH, MEDIUM, LOW)
+            config: Configuración del tópico y particiones
+        """
+        consumer = None
+        try:
+            Logger.info(f"Iniciando hilo consumidor {priority}")
+
+            # Configurar consumidor con configuración mejorada
+            consumer_config = KAFKA_CONFIG.copy()
+            consumer_config['group.id'] = f"{consumer_config['group.id']}-{priority.lower()}"
+
+            consumer = Consumer(consumer_config)
+            consumer.subscribe([config['name']])
+
+            Logger.debug(f"Consumidor {priority} suscrito al tópico {config['name']}")
+
+            # Bucle principal de consumo
+            consecutive_errors = 0
+            while not self.exit_flag.is_set():
+                try:
+                    # Poll para nuevos mensajes
+                    msg = consumer.poll(timeout=1.0)
+
+                    if msg is None:
+                        consecutive_errors = 0
+                        continue
+
+                    if msg.error():
+                        if msg.error().code() == KafkaError._PARTITION_EOF:
+                            Logger.debug(f"Fin de partición {msg.partition()}")
+                        else:
+                            Logger.error(f"Error en consumidor {priority}: {msg.error()}")
+                            consecutive_errors += 1
+                            if consecutive_errors > 5:
+                                time.sleep(5)
+                                consecutive_errors = 0
+                        continue
+
+                    # Procesar mensaje
+                    try:
+                        partition = msg.partition()
+                        offset = msg.offset()
+                        payload = json.loads(msg.value().decode('utf-8'))
+                        operation_id = payload.get('id')
+
+                        # Crear identificador único del mensaje
+                        message_id = f"{config['name']}-{partition}-{offset}-{operation_id}"
+
+                        # Verificar si ya procesamos este mensaje
+                        with self.processed_lock:
+                            if message_id in self.processed_messages:
+                                Logger.warning(f"Mensaje duplicado detectado: {message_id}, ignorando...")
+                                consumer.commit(msg)
+                                continue
+                            else:
+                                self.processed_messages.add(message_id)
+
+                        # Agregar metadatos para tracking
+                        payload['_kafka_metadata'] = {
+                            'topic': config['name'],
+                            'partition': partition,
+                            'offset': offset,
+                            'message_id': message_id
+                        }
+
+                        # Enrutar mensaje a su cola de partición
+                        self.message_queues[priority][partition].put(payload)
+                        Logger.debug(f"Mensaje {operation_id} encolado en partición {partition}")
+
+                        # Commit exitoso
+                        consumer.commit(msg)
+                        consecutive_errors = 0
+
+                    except json.JSONDecodeError:
+                        Logger.error(f"Mensaje con formato inválido: {msg.value()}")
+                        consumer.commit(msg)
+                    except Exception as queue_error:
+                        Logger.error(f"Error encolando mensaje en partición {partition}: {str(queue_error)}")
+                        time.sleep(0.1)
+
+                except Exception as e:
+                    consecutive_errors += 1
+                    if not self.exit_flag.is_set():
+                        Logger.error(f"Error en bucle de consumo {priority}: {str(e)}")
+                        if consecutive_errors > 10:
+                            break
+                        time.sleep(min(consecutive_errors * 0.5, 5))
+
+        except Exception as e:
+            Logger.error(f"Error fatal en consumidor {priority}: {str(e)}")
+        finally:
+            if consumer:
+                try:
+                    consumer.close()
+                    Logger.debug(f"Consumidor {priority} cerrado correctamente")
+                except Exception as e:
+                    Logger.warning(f"Error cerrando consumidor {priority}: {str(e)}")
+
+    def _worker_thread(self, priority, partition, message_queue):
+        """
+        Hilo trabajador para procesar mensajes de una partición específica.
+
+        Args:
+            priority: Nivel de prioridad (HIGH, MEDIUM, LOW)
+            partition: Número de partición
+            message_queue: Cola de mensajes para esta partición
+        """
+        thread_name = f"{priority}-P{partition}"
+        Logger.info(f"Iniciando hilo trabajador {thread_name}")
+
+        # Procesamiento de mensajes
+        while not self.exit_flag.is_set():
+            try:
+                # Obtener mensaje (con timeout para permitir verificación de exit_flag)
+                try:
+                    message = message_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+
+                operation_id = message.get('id')
+                slice_id = message.get('payload', {}).get('slice_info', {}).get('id')
+                operation_type = message.get('operationType')
+
+                Logger.subsection(f"PROCESANDO OPERACIÓN {operation_id} (Slice {slice_id})")
+                Logger.debug(f"🔍 Tipo: {operation_type}, Prioridad: {priority}, Partición: {partition}")
+                message_metadata = message.get('_kafka_metadata', {})
+                Logger.debug(f"🔍 Worker: {thread_name}, Metadata: {message_metadata}")
+
+                # Solo actualizar estado una vez
+                # Verificar orden de operaciones para el mismo slice
+                if slice_id is not None:
+                    self._process_in_order(message, priority, partition, thread_name)
+                else:
+                    # Solo para operaciones sin slice_id
+                    self._update_operation_status(message, "PROCESSING")
+                    self._process_operation(message)
+
+                # Marcar mensaje como completado
+                message_queue.task_done()
+
+            except Exception as e:
+                if not self.exit_flag.is_set():
+                    Logger.error(f"Error en trabajador {thread_name}: {str(e)}")
+                    Logger.debug(f"Traceback: {traceback.format_exc()}")
+                    # Actualizar estado de error
+                    try:
+                        self._update_operation_status(message, "ERROR", error_message=str(e))
+                    except:
+                        pass
+                    # Pequeña pausa para prevenir ciclos de error
+                    time.sleep(0.5)
+
+        Logger.debug(f"Hilo trabajador {thread_name} finalizado")
+
+    def _process_in_order(self, message, priority, partition, thread_name):
+        """
+        Procesa operaciones manteniendo orden FIFO por SliceId.
+
+        Args:
+            message: Mensaje a procesar
+            priority: Nivel de prioridad
+            partition: Número de partición
+        """
+        slice_id = message.get('payload', {}).get('slice_info', {}).get('id')
+
+        if not slice_id:
+            # Si no hay SliceId, procesar directamente
+            self._update_operation_status(message, "PROCESSING")
+            self._process_operation(message)
+            return
+
+        # Adquirir lock para operaciones de este slice
+        with slice_queue_lock:
+            if slice_id not in slice_operation_queues:
+                slice_operation_queues[slice_id] = queue.Queue()
+                slice_operation_locks[slice_id] = threading.Lock()
+
+        # Añadir operación a la cola de este slice
+        slice_operation_queues[slice_id].put((message, thread_name))
+
+        # Intentar procesar cola de este slice (solo lo hará el primer thread que tome el lock)
+        if slice_operation_locks[slice_id].acquire(blocking=False):
+            try:
+                # Procesar todas las operaciones pendientes en orden
+                while not slice_operation_queues[slice_id].empty():
+                    try:
+                        next_operation, origin_thread = slice_operation_queues[slice_id].get(block=False)
+                        operation_id = next_operation.get('id')
+
+                        Logger.debug(
+                            f"🔍 Procesando operación {operation_id} (origen: {origin_thread}, procesador: {thread_name})")
+
+                        # CORRECCIÓN: Solo actualizar estado a PROCESSING para la primera operación
+                        # y solo por el thread que realmente procesará
+                        if origin_thread == thread_name:
+                            self._update_operation_status(next_operation, "PROCESSING")
+
+                        self._process_operation(next_operation)
+                        slice_operation_queues[slice_id].task_done()
+
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        Logger.error(f"Error procesando operación para slice {slice_id}: {str(e)}")
+                        self._update_operation_status(next_operation, "ERROR", error_message=str(e))
+                        slice_operation_queues[slice_id].task_done()
+            finally:
+                # Liberar lock
+                slice_operation_locks[slice_id].release()
+
+                # Limpiar recursos si la cola está vacía
+                with slice_queue_lock:
+                    if slice_operation_queues[slice_id].empty():
+                        Logger.debug(f"🔍 Limpiando recursos para slice {slice_id}")
+                        del slice_operation_queues[slice_id]
+                        del slice_operation_locks[slice_id]
+
+    def _process_operation(self, message):
+        """
+        Procesa una operación según su tipo.
+
+        Args:
+            message: Mensaje con la operación a procesar
+        """
+        try:
+            operation_type = message.get('operationType')
+            operation_id = message.get('id')
+
+            Logger.info(f"ℹ Procesando operación {operation_id} de tipo {operation_type}")
+
+            # Procesar según tipo de operación
+            if operation_type == "DEPLOY_SLICE":
+                self._process_deploy_slice(message)
+            else:
+                Logger.warning(f"Tipo de operación no implementado: {operation_type}")
+                self._update_operation_status(
+                    message,
+                    "ERROR",
+                    error_message=f"Tipo de operación no implementado: {operation_type}"
+                )
+
+        except Exception as e:
+            Logger.error(f"Error procesando operación {message.get('id')}: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
+            self._update_operation_status(
+                message,
+                "ERROR",
+                error_message=str(e)
+            )
+            raise
+
+    def _process_deploy_slice(self, message):
+        """
+        Procesa una operación de despliegue de slice.
+
+        Args:
+            message: Mensaje con la operación de despliegue
+        """
+        try:
+            Logger.subsection(f"PROCESANDO DEPLOY_SLICE {message.get('id')}")
+
+            # Extraer payload
+            payload = message.get('payload', {})
+            if not payload:
+                raise ValueError("Payload vacío en mensaje de despliegue")
+
+            # Actualizar a IN_PROGRESS y notificar antes de empezar
+            Logger.info("ℹ Actualizando estado a IN_PROGRESS...")
+            self._update_operation_status(message, "PROCESSING")  # Esto se mapea a IN_PROGRESS en BD
+
+            # Notificar al Slice Manager que empezó el procesamiento
+            try:
+                self._notify_slice_manager_progress(message, "IN_PROGRESS", "Iniciando despliegue de slice...")
+            except Exception as e:
+                Logger.warning(f"Error notificando progreso: {str(e)}")
+                # No detenemos el despliegue por esto
+
+            # Ejecutar despliegue usando la lógica existente
+            Logger.info("ℹ Iniciando despliegue con SliceManager...")
+            deployed_config = self.slice_manager.deploy_slice(payload)
+
+            # Actualizar resultado en la base de datos ANTES del estado final
+            Logger.debug(f"🔍 Actualizando resultado de operación {message.get('id')}")
+            self._update_operation_result(message.get('id'), deployed_config)
+
+            # Actualizar estado final en base de datos
+            Logger.debug(f"🔍 Actualizando estado de operación {message.get('id')} a COMPLETED")
+            self._update_operation_status(message, "COMPLETED")
+
+            # Notificar al Slice Manager
+            Logger.debug(f"🔍 Notificando resultado final al Slice Manager")
+            self._notify_slice_manager(message, "COMPLETED", deployed_config)
+
+            Logger.success(f"✓ Despliegue de slice {payload.get('slice_info', {}).get('id')} completado exitosamente")
+
+        except Exception as e:
+            Logger.error(f"Error en despliegue: {str(e)}")
+            # Limpiar recursos si es necesario
+            Logger.debug(f"🔍 Limpiando recursos para slice {payload.get('slice_info', {}).get('id', 'unknown')}")
+            self._update_operation_status(message, "ERROR", error_message=str(e))
+            self._notify_slice_manager(message, "FAILED", error_message=str(e))
+            raise
+
+    def _update_operation_status(self, message, status, error_message=None):
+        """
+        Actualiza el estado de una operación en la base de datos.
+
+        Args:
+            message: Mensaje de la operación
+            status: Nuevo estado (PENDING, PROCESSING, COMPLETED, ERROR)
+            error_message: Mensaje de error (opcional)
+        """
+        operation_id = message.get('id')
+
+        if not operation_id:
+            Logger.error("No se puede actualizar estado: operation_id no encontrado")
+            return
+
+        with self.db_lock:
+            try:
+                Logger.debug(f"🔍 Actualizando estado de operación {operation_id} a {status}")
+
+                # Mapear estados correctamente
+                status_mapping = {
+                    "PENDING": "PENDING",
+                    "PROCESSING": "IN_PROGRESS",  # Mapeo correcto
+                    "COMPLETED": "COMPLETED",
+                    "ERROR": "FAILED"
+                }
+
+                db_status = status_mapping.get(status, status)
+                current_time = datetime.now()
+
+                # Construir query de actualización dinámica
+                update_fields = ["status = %s"]
+                update_params = [db_status]
+
+                # Actualizar campos adicionales según el estado
+                if db_status == "IN_PROGRESS":
+                    update_fields.append("started_at = %s")
+                    update_params.append(current_time)
+
+                if db_status in ["COMPLETED", "FAILED"]:
+                    update_fields.append("completed_at = %s")
+                    update_params.append(current_time)
+
+                if error_message and db_status == "FAILED":
+                    update_fields.append("error_message = %s")
+                    update_params.append(error_message)
+
+                # Construir query final
+                update_query = f"""
+                    UPDATE operation_requests 
+                    SET {', '.join(update_fields)}
+                    WHERE id = %s
+                """
+                update_params.append(operation_id)
+
+                Logger.debug(f"🔍 Ejecutando query: {update_query.strip()}")
+                Logger.debug(f"🔍 Parámetros: {tuple(update_params)}")
+
+                # Ejecutar query y verificar que se actualizó
+                result = self.db_manager.execute_query(update_query, tuple(update_params))
+
+                # Verificar que la actualización fue exitosa
+                check_query = "SELECT status, started_at, completed_at FROM operation_requests WHERE id = %s"
+                check_result = self.db_manager.execute_query(check_query, (operation_id,))
+
+                if check_result:
+                    actual_status = check_result[0]['status']
+                    Logger.debug(f"🔍 Estado actualizado verificado: {actual_status}")
+                    if actual_status != db_status:
+                        Logger.warning(f"Estado en BD ({actual_status}) no coincide con esperado ({db_status})")
+                else:
+                    Logger.error(f"No se encontró operation_request con ID {operation_id}")
+
+                Logger.debug(f"🔍 Query ejecutada exitosamente")
+
+                # Solo actualizar métricas cuando la operación está completa
+                if db_status in ["COMPLETED", "FAILED"]:
+                    # Ejecutar en thread separado para no bloquear
+                    metrics_thread = threading.Thread(target=self._update_queue_metrics)
+                    metrics_thread.daemon = True
+                    metrics_thread.start()
+
+            except Exception as e:
+                Logger.error(f"Error actualizando estado en BD para operación {operation_id}: {str(e)}")
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+                # Intentar un rollback si estamos en transacción
+                try:
+                    # Log del estado actual para debugging
+                    check_query = "SELECT * FROM operation_requests WHERE id = %s"
+                    current_state = self.db_manager.execute_query(check_query, (operation_id,))
+                    Logger.debug(f"Estado actual en BD: {current_state}")
+                except:
+                    pass
+
+    def _update_operation_result(self, operation_id, result):
+        with self.db_lock:
+            try:
+                Logger.debug(f"🔍 Actualizando resultado de operación {operation_id}")
+
+                update_query = "UPDATE operation_requests SET result_json = %s WHERE id = %s"
+                result_json = json.dumps(result)
+
+                Logger.debug(f"🔍 Ejecutando query: {update_query}")
+                Logger.debug(f"🔍 Parámetros: (resultado_json, {operation_id})")
+
+                self.db_manager.execute_query(update_query, (result_json, operation_id))
+                Logger.debug(f"🔍 Query ejecutada exitosamente")
+
+            except Exception as e:
+                Logger.error(f"Error actualizando resultado en BD: {str(e)}")
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+    def _update_queue_metrics(self):
+        """
+        Actualiza las métricas de las colas en la tabla queue_metrics.
+        Registra conteos y tiempos promedio para monitoreo.
+        """
+        with self.db_lock:
+            try:
+                # Obtener timestamp actual para el registro
+                current_time = datetime.now()
+                date_only = current_time.strftime('%Y-%m-%d 00:00:00')
+
+                # Para cada cola en el sistema
+                for priority, config in KAFKA_TOPICS.items():
+                    queue_name = config['name']
+
+                    # Query corregida con SUM para obtener conteos correctos
+                    stats_query = """
+                                  SELECT 
+                                      SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending_count,
+                                      SUM(CASE WHEN status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as in_progress_count,
+                                      SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed_count,
+                                      SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed_count,
+                                      AVG(CASE 
+                                          WHEN started_at IS NOT NULL AND submitted_at IS NOT NULL 
+                                          THEN TIMESTAMPDIFF(SECOND, submitted_at, started_at)
+                                          ELSE NULL 
+                                      END) as avg_wait_time,
+                                      AVG(CASE 
+                                          WHEN completed_at IS NOT NULL AND started_at IS NOT NULL 
+                                          THEN TIMESTAMPDIFF(SECOND, started_at, completed_at)
+                                          ELSE NULL 
+                                      END) as avg_processing_time,
+                                      MAX(CASE 
+                                          WHEN started_at IS NOT NULL AND submitted_at IS NOT NULL 
+                                          THEN TIMESTAMPDIFF(SECOND, submitted_at, started_at)
+                                          ELSE NULL 
+                                      END) as max_wait_time,
+                                      MAX(CASE 
+                                          WHEN completed_at IS NOT NULL AND started_at IS NOT NULL 
+                                          THEN TIMESTAMPDIFF(SECOND, started_at, completed_at)
+                                          ELSE NULL 
+                                      END) as max_processing_time
+                                  FROM operation_requests
+                                  WHERE queue_name = %s
+                                  """
+
+                    Logger.debug(f"🔍 Ejecutando query: {stats_query}")
+                    Logger.debug(f"🔍 Parámetros: ('{queue_name}',)")
+                    stats = self.db_manager.execute_query(stats_query, (queue_name,))
+                    Logger.debug(f"🔍 Filas obtenidas: {len(stats)}")
+
+                    if not stats or not stats[0]:
+                        Logger.debug(f"No hay estadísticas disponibles para la cola {queue_name}")
+                        continue
+
+                    stat = stats[0]
+
+                    # Verificar si ya existe un registro para hoy
+                    check_query = """
+                                  SELECT id 
+                                  FROM queue_metrics
+                                  WHERE queue_name = %s 
+                                    AND DATE(record_date) = DATE(%s)
+                                  """
+
+                    Logger.debug(f"🔍 Ejecutando query: {check_query}")
+                    Logger.debug(f"🔍 Parámetros: ('{queue_name}', {current_time})")
+                    existing = self.db_manager.execute_query(check_query, (queue_name, current_time))
+                    Logger.debug(f"🔍 Filas obtenidas: {len(existing)}")
+
+                    if existing:
+                        # Actualizar registro existente
+                        update_query = """
+                                       UPDATE queue_metrics 
+                                       SET pending_count = %s,
+                                           in_progress_count = %s,
+                                           completed_count = %s,
+                                           failed_count = %s,
+                                           average_wait_time_seconds = %s,
+                                           average_processing_time_seconds = %s,
+                                           max_wait_time_seconds = %s,
+                                           max_processing_time_seconds = %s,
+                                           last_updated = %s
+                                       WHERE id = %s
+                                       """
+
+                        params = (
+                            stat['pending_count'] or 0,
+                            stat['in_progress_count'] or 0,
+                            stat['completed_count'] or 0,
+                            stat['failed_count'] or 0,
+                            stat['avg_wait_time'],
+                            stat['avg_processing_time'],
+                            stat['max_wait_time'],
+                            stat['max_processing_time'],
+                            current_time,
+                            existing[0]['id']
+                        )
+
+                        Logger.debug(f"🔍 Ejecutando query: {update_query}")
+                        Logger.debug(f"🔍 Parámetros: {params}")
+                        self.db_manager.execute_query(update_query, params)
+                    else:
+                        # Insertar nuevo registro
+                        insert_query = """
+                                       INSERT INTO queue_metrics
+                                       (queue_name, pending_count, in_progress_count, completed_count,
+                                        failed_count, average_wait_time_seconds, average_processing_time_seconds,
+                                        max_wait_time_seconds, max_processing_time_seconds, last_updated, record_date)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                       """
+
+                        params = (
+                            queue_name,
+                            stat['pending_count'] or 0,
+                            stat['in_progress_count'] or 0,
+                            stat['completed_count'] or 0,
+                            stat['failed_count'] or 0,
+                            stat['avg_wait_time'],
+                            stat['avg_processing_time'],
+                            stat['max_wait_time'],
+                            stat['max_processing_time'],
+                            current_time,
+                            date_only
+                        )
+
+                        Logger.debug(f"🔍 Ejecutando query: {insert_query}")
+                        Logger.debug(f"🔍 Parámetros: {params}")
+                        self.db_manager.execute_query(insert_query, params)
+                        Logger.debug(f"🔍 Query ejecutada sin resultados")
+
+            except Exception as e:
+                Logger.error(f"Error actualizando métricas de cola: {str(e)}")
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+    def _notify_slice_manager(self, message, status, result=None, error_message=None):
+        """
+        Notifica al Slice Manager sobre el resultado de una operación.
+
+        Args:
+            message: Mensaje original
+            status: Estado final (COMPLETED, FAILED)
+            result: Resultado de la operación (opcional)
+            error_message: Mensaje de error (opcional)
+        """
+        try:
+            # Obtener instancia del Slice Manager vía Eureka
+            slice_manager = get_service_instance('slice-manager')
+            if not slice_manager:
+                Logger.error("No se pudo obtener instancia del Slice Manager")
+                return
+
+            operation_id = message.get('id')
+            operation_type = message.get('operationType')
+            user_id = message.get('userId')
+
+            Logger.debug(f"🔍 Instancia encontrada: {json.dumps(slice_manager, indent=2)}")
+            Logger.info(f"ℹ Notificando resultado de operación {operation_id} al Slice Manager")
+
+            # Preparar payload de notificación
+            notification = {
+                "operationId": operation_id,
+                "operationType": operation_type,
+                "userId": user_id,
+                "status": status,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            if result:
+                notification["result"] = result
+
+            if error_message:
+                notification["error"] = error_message
+
+            # Enviar notificación
+            response = requests.post(
+                f"http://{slice_manager['ipAddr']}:{slice_manager['port']}/operation-callback",
+                json=notification
+            )
+
+            if response.status_code == 200:
+                Logger.success(f"✓ Notificación enviada exitosamente")
+            else:
+                Logger.warning(f"Error enviando notificación: {response.status_code}")
+                Logger.debug(f"Respuesta: {response.text}")
+
+        except Exception as e:
+            Logger.error(f"Error notificando al Slice Manager: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
+
+    def _notify_slice_manager_progress(self, message, status, progress_message):
+        """
+        Notifica al Slice Manager sobre el progreso de una operación.
+
+        Args:
+            message: Mensaje original
+            status: Estado actual (IN_PROGRESS, etc.)
+            progress_message: Mensaje de progreso
+        """
+        try:
+            # Obtener instancia del Slice Manager vía Eureka
+            slice_manager = get_service_instance('slice-manager')
+            if not slice_manager:
+                Logger.error("No se pudo obtener instancia del Slice Manager para progreso")
+                return
+
+            operation_id = message.get('id')
+            operation_type = message.get('operationType')
+            user_id = message.get('userId')
+
+            Logger.info(f"ℹ Notificando progreso de operación {operation_id} al Slice Manager")
+
+            # Preparar payload de notificación de progreso
+            notification = {
+                "operationId": operation_id,
+                "operationType": operation_type,
+                "userId": user_id,
+                "status": status,
+                "message": progress_message,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Enviar notificación
+            response = requests.post(
+                f"http://{slice_manager['ipAddr']}:{slice_manager['port']}/operation-progress",
+                json=notification,
+                timeout=10  # Timeout corto para no bloquear
+            )
+
+            if response.status_code == 200:
+                Logger.success(f"✓ Notificación de progreso enviada exitosamente")
+            else:
+                Logger.warning(f"Error enviando notificación de progreso: {response.status_code}")
+                Logger.debug(f"Respuesta: {response.text}")
+
+        except Exception as e:
+            Logger.error(f"Error notificando progreso al Slice Manager: {str(e)}")
+            Logger.debug(f"Traceback: {traceback.format_exc()}")
 
 # ===================== API ENDPOINTS =====================
 """
@@ -2905,6 +4017,7 @@ def deploy_slice_endpoint():
     Request body:
     {
         "slice_info": {
+            "id": int,
             "name": str,
             "description": str,
             ...
@@ -3506,6 +4619,107 @@ def sync_images_endpoint():
             "details": str(e)
         }), 500
 
+
+@app.route('/kafka-status', methods=['GET'])
+def kafka_status_endpoint():
+    """
+    Endpoint para verificar el estado del procesador Kafka.
+
+    Returns:
+        200: Estado del procesador Kafka
+    """
+    try:
+        Logger.section("API: KAFKA STATUS")
+
+        # Verificar estado de consumidores y workers
+        worker_status = {}
+
+        for priority, workers in kafka_processor.worker_threads.items():
+            worker_status[priority] = {
+                "total": len(workers),
+                "active": sum(1 for w in workers if w.is_alive())
+            }
+
+        consumer_status = {}
+        for priority, consumer in kafka_processor.consumers.items():
+            consumer_status[priority] = {
+                "active": consumer.is_alive()
+            }
+
+        # Verificar mensajes en colas
+        queue_status = {}
+        for priority, queues in kafka_processor.message_queues.items():
+            queue_status[priority] = {
+                f"partition_{i}": q.qsize()
+                for i, q in enumerate(queues)
+            }
+
+        # Obtener estadísticas de operaciones
+        status_query = """
+                       SELECT status, COUNT(*) as count
+                       FROM operation_requests
+                       GROUP BY status \
+                       """
+        status_counts = kafka_processor.db_manager.execute_query(status_query)
+
+        type_query = """
+                     SELECT operation_type, COUNT(*) as count
+                     FROM operation_requests
+                     GROUP BY operation_type \
+                     """
+        type_counts = kafka_processor.db_manager.execute_query(type_query)
+
+        # Obtener métricas de las colas
+        metrics_query = """
+                        SELECT queue_name, \
+                               pending_count, \
+                               in_progress_count,
+                               completed_count, \
+                               failed_count,
+                               average_wait_time_seconds, \
+                               average_processing_time_seconds
+                        FROM queue_metrics
+                        WHERE DATE (record_date) = CURDATE() \
+                        """
+        queue_metrics = kafka_processor.db_manager.execute_query(metrics_query)
+
+        # Preparar respuesta
+        status_data = {
+            "consumers": consumer_status,
+            "workers": worker_status,
+            "queues": queue_status,
+            "operations": {
+                "by_status": {item['status']: item['count'] for item in status_counts},
+                "by_type": {item['operation_type']: item['count'] for item in type_counts}
+            },
+            "queue_metrics": {
+                item['queue_name']: {
+                    "pending": item['pending_count'],
+                    "in_progress": item['in_progress_count'],
+                    "completed": item['completed_count'],
+                    "failed": item['failed_count'],
+                    "avg_wait_time": item['average_wait_time_seconds'],
+                    "avg_processing_time": item['average_processing_time_seconds']
+                } for item in queue_metrics
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+
+        return jsonify({
+            "status": "success",
+            "message": "Estado del procesador Kafka",
+            "content": status_data
+        }), 200
+
+    except Exception as e:
+        Logger.error(f"Error en kafka_status_endpoint: {str(e)}")
+        Logger.debug(f"Traceback: {traceback.format_exc()}")
+        return jsonify({
+            "status": "error",
+            "message": "Error obteniendo estado de Kafka",
+            "details": str(e)
+        }), 500
+
 @app.errorhandler(Exception)
 def handle_error(error):
     """
@@ -3566,29 +4780,42 @@ def handle_error(error):
 if __name__ == '__main__':
     try:
         Logger.major_section("INICIANDO LINUX DRIVER")
-        
+
         # 1. Inicializar estructura de directorios
         Logger.info("Verificando estructura de directorios...")
         if not init_directories():
             Logger.error("Error crítico: No se pudo crear la estructura de directorios")
             raise Exception("No se pudo crear la estructura de directorios necesaria")
         Logger.success("Estructura de directorios verificada")
-           
-        # 2. Iniciar servidor Flask
+
+        # 2. Iniciar procesador Kafka
+        Logger.section("INICIANDO PROCESADOR KAFKA")
+        kafka_processor = KafkaProcessor()
+        kafka_processor.start()
+        Logger.success("Procesador Kafka iniciado")
+
+        # 3. Iniciar servidor Flask
         Logger.section("INICIANDO SERVIDOR WEB")
         Logger.info("Configuración del servidor:")
         Logger.info(f"- Puerto: {port}")
         Logger.info(f"- Debug: {debug}")
-        
+
         Logger.debug("Iniciando servidor Flask...")
         Logger.success("Linux Driver listo para recibir conexiones")
-        
-        app.run(
-            host=host,
-            port=port, 
-            debug=debug
-        )
-        
+
+        # Manejar cierre al detener el servidor
+        try:
+            app.run(
+                host=host,
+                port=port,
+                debug=debug
+            )
+        finally:
+            # Detener procesador Kafka al finalizar Flask
+            Logger.section("DETENIENDO SERVICIOS")
+            kafka_processor.stop()
+            Logger.info("Servicios detenidos")
+
     except Exception as e:
         Logger.error(f"Error crítico durante el inicio: {str(e)}")
         Logger.debug(f"Traceback: {traceback.format_exc()}")
