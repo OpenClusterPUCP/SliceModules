@@ -1784,7 +1784,6 @@ class SliceManager:
             # Limpieza en el HeadNode
 
             # Obtener información del slice
-            slice_id = slice_config['slice_info']['id'] if 'slice_config' in locals() else slice_id
             network_config = request_data['network_config']
             svlan = network_config['svlan_id']
             network = network_config['network']
