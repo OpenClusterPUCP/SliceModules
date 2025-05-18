@@ -1365,6 +1365,44 @@ class SliceProcessor:
             Logger.error(f"Error obteniendo siguiente ID de interface con bloqueo: {str(e)}")
             raise
 
+    def get_next_external_ip_with_lock(self, conn, cursor) -> str:
+        """
+        Obtiene la siguiente IP disponible del pool 10.60.11.0/24 con bloqueo.
+        Si se acabaron las IPs disponibles, retorna None.
+
+        Args:
+            conn: Conexión activa a la BD
+            cursor: Cursor de la conexión
+
+        Returns:
+            str: Siguiente IP disponible o None si no hay más
+        """
+        try:
+            Logger.debug("Obteniendo siguiente IP externa disponible con bloqueo")
+            
+            # Obtener IPs ya asignadas
+            cursor.execute("""
+                SELECT ip FROM interface 
+                WHERE external_access = 1 
+                AND ip LIKE '10.60.11.%' 
+                ORDER BY ip FOR UPDATE
+            """)
+            used_ips = [row['ip'] for row in cursor.fetchall() if row['ip']]
+            
+            # Encontrar siguiente IP disponible
+            for i in range(2, 255):  # Empezamos desde .2 (dejando .1 para gateway)
+                candidate_ip = f"10.60.11.{i}"
+                if candidate_ip not in used_ips:
+                    Logger.debug(f"IP externa reservada: {candidate_ip}")
+                    return candidate_ip
+                    
+            Logger.warning("No hay más IPs externas disponibles en el pool")
+            return None
+            
+        except Exception as e:
+            Logger.error(f"Error obteniendo siguiente IP externa: {str(e)}")
+            raise
+
     def get_available_vnc_displays(self) -> List[int]:
         """
         Obtiene números de display VNC disponibles.
@@ -1591,7 +1629,7 @@ class SliceProcessor:
                 "slice_side": f"p-s{slice_id}-int",
                 "int_side": f"p-br-s{slice_id}"
             },
-            "dhcp_interface": f"veth-int.{slice_id}",
+            "dhcp_interface": f"veth-int-{slice_id}",
             "gateway_interface": f"gw-{slice_id}"
         }
 
@@ -1776,10 +1814,15 @@ class SliceProcessor:
                 if new_vm_id not in vm_interface_counters:
                     vm_interface_counters[new_vm_id] = 1
 
+                # Asignar IP externa si es posible
+                external_ip = None
                 if iface.get('external_access', False):
                     new_link_id = None
                     iface['tap_name'] = f"tx-V{new_vm_id}-S{slice_id}"
                     iface['external_access'] = True
+                    # Obtener siguiente IP externa disponible
+                    external_ip = self.get_next_external_ip_with_lock(conn, cursor)
+                    Logger.debug(f"IP externa asignada a interfaz {iface['name']}: {external_ip or 'None - Pool agotado'}")
                 else:
                     new_link_id = link_id_mapping.get(old_link_id)
                     if new_link_id is None:
@@ -1794,12 +1837,13 @@ class SliceProcessor:
                 iface['vm_id'] = new_vm_id
                 iface['link_id'] = new_link_id
                 iface['mac_address'] = self.generate_mac_address(slice_id, new_if_id, new_vm_id)
+                iface['ip'] = external_ip  # Guardamos la IP asignada (None si no es externa)
 
                 # Reservar Interface en la base de datos
                 cursor.execute(
                     """INSERT INTO interface
-                           (id, name, mac, vm, link, external_access, tap_name)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                        (id, name, mac, vm, link, external_access, tap_name, ip)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         new_if_id,
                         iface['name'],
@@ -1807,14 +1851,16 @@ class SliceProcessor:
                         new_vm_id,
                         new_link_id,
                         iface.get('external_access', False),
-                        iface['tap_name']
+                        iface['tap_name'],
+                        external_ip  # Agregamos la IP a la inserción
                     )
                 )
 
                 Logger.debug(
                     f"Interface con nombre '{iface['name']}': ID-{new_if_id}, "
                     f"VM ID-{old_vm_id} -> ID-{new_vm_id}, "
-                    f"Link ID-{old_link_id} -> ID-{new_link_id}"
+                    f"Link ID-{old_link_id} -> ID-{new_link_id}, "
+                    f"IP: {external_ip or 'N/A'}"
                 )
 
             # 5. Recopilar información de recursos
@@ -4784,7 +4830,7 @@ def stop_slice_endpoint(slice_id: str):
                 ps.ssh_username, ps.ssh_password, ps.ssh_key_path,
                 i.id as interface_id, i.name as interface_name,
                 i.mac as interface_mac, i.tap_name,
-                i.external_access
+                i.external_access, i.ip as interface_ip
             FROM slice s
             JOIN virtual_machine vm ON vm.slice = s.id
             JOIN physical_server ps ON vm.physical_server = ps.id
@@ -4855,7 +4901,8 @@ def stop_slice_endpoint(slice_id: str):
                     "vm_id": row['vm_id'],  # Agregamos el vm_id
                     "mac_address": row['interface_mac'],
                     "tap_name": row['tap_name'],
-                    "external_access": row['external_access']
+                    "external_access": row['external_access'],
+                    "ip": row['interface_ip']
                 }
                 interfaces_by_vm[row['vm_id']].append(interface_data)
 

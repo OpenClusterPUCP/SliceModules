@@ -719,7 +719,12 @@ class SliceManager:
 
             # Inyectar slice_id en network_config para nombres únicos (AJUSTE PARA PARALELISMO)
             slice_config['network_config']['slice_id'] = slice_config['slice_info']['id']
-            self._setup_internet_access(slice_config['network_config'])
+            # Agregar las interfaces con acceso externo
+            external_interfaces = [
+            interface for interface in slice_config['topology_info']['interfaces']
+                if interface.get('external_access', False)
+            ]
+            self._setup_internet_access(slice_config['network_config'], external_interfaces)
 
             # 3. Configuración paralela de workers
             current_stage = 'worker_setup'
@@ -772,95 +777,6 @@ class SliceManager:
             Logger.section("INICIANDO LIMPIEZA POR ERROR")
             self._cleanup_deployment_state(slice_config, current_stage)
             raise Exception(error_msg)
-
-    # def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict, 
-    #                 results: dict, errors: dict):
-    #     """
-    #     Configura un worker específico para el despliegue de sus VMs asignadas.
-        
-    #     Realiza la configuración completa de un worker incluyendo:
-    #     1. Configuración de bridges OVS
-    #     2. Configuración de interfaces TAP
-    #     3. Preparación de imágenes
-    #     4. Inicio de VMs
-        
-    #     Args:
-    #         worker_info (dict): Información del worker a configurar
-    #         vms (list): Lista de VMs a desplegar en este worker
-    #         slice_config (dict): Configuración completa del slice
-    #         results (dict): Diccionario para almacenar resultados
-    #         errors (dict): Diccionario para almacenar errores
-    #     """
-    #     try:
-    #         Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
-    #         Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
-    #         Logger.info(f"VMs a configurar: {len(vms)}")
-
-    #         # Preparar información SSH
-    #         ssh_info = {
-    #             'name': worker_info['name'],
-    #             'ip': worker_info['ip'],
-    #             'ssh_username': worker_info['ssh_username'],
-    #             'ssh_password': worker_info.get('ssh_password'),
-    #             'ssh_key_path': worker_info.get('ssh_key_path')
-    #         }
-
-    #         with SSHManager(ssh_info) as ssh:
-    #             # 1. Configuración de bridges
-    #             Logger.info(f"Configurando bridges en {worker_info['name']}...")
-    #             bridge_commands = self._generate_bridge_commands(slice_config['network_config'])
-    #             Logger.debug(f"Comandos bridge: {' && '.join(bridge_commands)}")
-    #             ssh.execute(" && ".join(bridge_commands))
-                
-    #             # 2. Configuración de interfaces TAP
-    #             Logger.info(f"Configurando interfaces TAP en {worker_info['name']}...")
-    #             tap_commands = self._generate_tap_commands(vms, slice_config)
-                
-    #             if tap_commands:
-    #                 Logger.debug(f"Ejecutando comandos TAP: {' && '.join(tap_commands)}")
-    #                 ssh.execute(" && ".join(tap_commands))
-
-
-    #             #Logger.info(f"Preparando imágenes en {worker_info['name']}...")
-    #             # image_commands = self._generate_image_commands(vms, slice_config)
-    #             #if image_commands:
-    #             #    Logger.debug(f"Comandos imagen: {' && '.join(image_commands)}")
-    #             #    ssh.execute(" && ".join(image_commands))
-
-    #             # 3. Iniciar VMs
-    #             vm_results = []
-    #             for vm in vms:
-    #                 Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
-    #                 self._start_single_vm(ssh, vm, slice_config)
-                    
-    #                 # Verificar estado
-    #                 stdout, _ = ssh.execute(
-    #                     f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
-    #                 )
-    #                 if stdout.strip():
-    #                     qemu_pid = int(stdout.split()[0])
-    #                     Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
-    #                     vm_results.append({
-    #                         'id': vm['id'],
-    #                         'qemu_pid': qemu_pid,
-    #                         'status': 'running'
-    #                     })
-
-    #             results[worker_info['name']] = {
-    #                 'success': True,
-    #                 'vms': vm_results
-    #             }
-    #             Logger.success(f"Configuración de {worker_info['name']} completada")
-                    
-    #     except Exception as e:
-    #         error_msg = f"Error en worker {worker_info['name']}: {str(e)}"
-    #         Logger.error(error_msg)
-    #         Logger.debug(f"Traceback: {traceback.format_exc()}")
-    #         errors[worker_info['name']] = str(e)
-    #         results[worker_info['name']] = {
-    #             'success': False,
-    #             'error': str(e)
-    #         }
 
     def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict, 
                     results: dict, errors: dict):
@@ -1133,7 +1049,7 @@ class SliceManager:
 
             # Copiar y redimensionar imagen usando los MB
             ssh.execute(f"sudo cp {base_path} {vm_image_path}")
-            ssh.execute(f"sudo qemu-img resize {vm_image_path} {adjusted_size_mb}M")
+            ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {adjusted_size_mb}M")
             ssh.execute(f"sudo chmod 644 {vm_image_path}")
 
             # Verificar el tamaño final
@@ -1328,16 +1244,145 @@ class SliceManager:
                 
         Logger.success("Puertos físicos configurados exitosamente")
 
-    def _setup_internet_access(self, network_config: dict):
+    # def _setup_internet_access(self, network_config: dict):
+    #     """
+    #     Configura acceso a internet y DHCP para el slice.
+        
+    #     Realiza la configuración completa:
+    #     1. Crea y configura namespace de red
+    #     2. Configura veth pairs y bridges
+    #     3. Configura NAT y forwarding
+    #     4. Configura servidor DHCP
+        
+    #     Args:
+    #         network_config (dict): Configuración de red con:
+    #             - slice_id: ID único del slice
+    #             - svlan_id: ID del SVLAN
+    #             - network: Red del slice (CIDR)
+    #             - dhcp_interface: Nombre interfaz DHCP
+    #             - gateway_interface: Nombre interfaz gateway
+    #     """
+    #     # LOCK GLOBAL PARA EVITAR CONDICIONES DE CARRERA
+    #     with network_setup_lock:
+    #         Logger.section("CONFIGURANDO ACCESO A INTERNET")
+
+    #         # Extraer información base
+    #         slice_id = network_config['slice_id']
+    #         svlan = network_config['svlan_id']
+    #         network = network_config['network']
+    #         gateway_if = network_config['gateway_interface']
+
+    #         # Generar nombres únicos por slice
+    #         namespace_name = f"ns-slice-{slice_id}"
+    #         veth_int_name = f"veth-int-{slice_id}"
+    #         veth_ext_name = f"veth-ext-{slice_id}"
+    #         dhcp_if = f"veth-int.{svlan}"
+
+    #         Logger.info(f"Slice ID: {slice_id}")
+    #         Logger.info(f"SVLAN: {svlan}")
+    #         Logger.info(f"Red: {network}")
+    #         Logger.info(f"Namespace: {namespace_name}")
+
+    #         try:
+    #             # 1. Verificar si namespace ya existe (evitar conflictos)
+    #             result = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
+    #             if namespace_name in result.stdout:
+    #                 Logger.warning(f"Namespace {namespace_name} ya existe, eliminando...")
+    #                 os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
+
+    #             # 2. Configurar namespace y veth pair únicos
+    #             Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
+
+    #             # Eliminar interfaces existentes si existen
+    #             os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
+
+    #             os.system(f"sudo ip netns add {namespace_name}")
+    #             os.system(f"sudo ip link add {veth_int_name} type veth peer name {veth_ext_name}")
+    #             os.system(f"sudo ip link set {veth_int_name} netns {namespace_name}")
+
+    #             # 3. Configurar interfaces
+    #             Logger.subsection("CONFIGURANDO INTERFACES")
+    #             os.system(f"sudo ip netns exec {namespace_name} ip link set {veth_int_name} up")
+    #             os.system(f"sudo ip netns exec {namespace_name} ip link set lo up")
+    #             os.system(f"sudo ip link set {veth_ext_name} up")
+
+    #             # Verificar que el bridge existe antes de agregar puerto
+    #             bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']],
+    #                                            capture_output=True)
+    #             if bridge_exists.returncode != 0:
+    #                 Logger.warning(f"Bridge {NETWORK_CONFIG['headnode_br']} no existe, creándolo...")
+    #                 os.system(f"sudo ovs-vsctl add-br {NETWORK_CONFIG['headnode_br']}")
+
+    #             os.system(f"sudo ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}")
+
+    #             # 4. Conectar a OVS y configurar gateway
+    #             Logger.subsection("CONFIGURANDO OVS Y GATEWAY")
+
+    #             # Eliminar puerto existente si existe
+    #             os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+
+    #             os.system(f"sudo ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+    #             os.system(f"sudo ovs-vsctl set interface {gateway_if} type=internal")
+    #             os.system(f"sudo ovs-vsctl set port {gateway_if} tag={svlan}")
+    #             os.system(f"sudo ip link set {gateway_if} up")
+
+    #             # Verificar si IP ya está asignada
+    #             ip_check = subprocess.run(['ip', 'addr', 'show', gateway_if], capture_output=True, text=True)
+    #             gateway_ip = network.replace('0/24', '1/24')
+    #             if gateway_ip.split('/')[0] not in ip_check.stdout:
+    #                 os.system(f"sudo ip addr add {gateway_ip} dev {gateway_if}")
+
+    #             # 5. Configurar VLAN subinterface dentro del namespace
+    #             Logger.subsection("CONFIGURANDO VLAN SUBINTERFACE")
+    #             os.system(
+    #                 f"sudo ip netns exec {namespace_name} ip link add link {veth_int_name} name {dhcp_if} type vlan id {svlan}")
+    #             os.system(f"sudo ip netns exec {namespace_name} ip link set {dhcp_if} up")
+    #             os.system(
+    #                 f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {dhcp_if}")
+
+    #             # 6. Configurar NAT (verificar existencia antes de agregar)
+    #             Logger.subsection("CONFIGURANDO NAT Y FORWARDING")
+    #             nat_commands = [
+    #                 f"sudo ip netns exec {namespace_name} iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo ip netns exec {namespace_name} iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+    #                 f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+    #                 f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+    #                 "sudo sysctl -w net.ipv4.ip_forward=1"
+    #             ]
+
+    #             for cmd in nat_commands:
+    #                 Logger.debug(f"Ejecutando: {cmd}")
+    #                 result = os.system(cmd)
+    #                 if result != 0:
+    #                     Logger.warning(f"Comando NAT falló: {cmd}")
+
+    #             # 7. Configurar DHCP
+    #             Logger.subsection("CONFIGURANDO DHCP")
+    #             dhcp_config = self._generate_dhcp_config(network_config, namespace_name)
+    #             self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
+
+    #             Logger.success("Configuración de red completada exitosamente")
+
+    #         except Exception as e:
+    #             Logger.error(f"Error en configuración de red: {str(e)}")
+    #             # Limpiar recursos parciales en caso de error
+    #             try:
+    #                 os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
+    #                 os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
+    #                 os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+    #             except:
+    #                 pass
+    #             raise
+    
+    def _setup_internet_access(self, network_config: dict, external_interfaces: list):
         """
         Configura acceso a internet y DHCP para el slice.
         
         Realiza la configuración completa:
         1. Crea y configura namespace de red
-        2. Configura veth pairs y bridges
-        3. Configura NAT y forwarding
+        2. Configura veth pairs y bridges con VLAN tagging
+        3. Configura NAT y forwarding en el host
         4. Configura servidor DHCP
-        
+
         Args:
             network_config (dict): Configuración de red con:
                 - slice_id: ID único del slice
@@ -1345,8 +1390,8 @@ class SliceManager:
                 - network: Red del slice (CIDR)
                 - dhcp_interface: Nombre interfaz DHCP
                 - gateway_interface: Nombre interfaz gateway
+            external_interfaces (list): Lista de interfaces con acceso externo
         """
-        # LOCK GLOBAL PARA EVITAR CONDICIONES DE CARRERA
         with network_setup_lock:
             Logger.section("CONFIGURANDO ACCESO A INTERNET")
 
@@ -1358,9 +1403,8 @@ class SliceManager:
 
             # Generar nombres únicos por slice
             namespace_name = f"ns-slice-{slice_id}"
-            veth_int_name = f"veth-int-{slice_id}"
+            veth_int_name = network_config['dhcp_interface'] # veth-int-{slice_id}
             veth_ext_name = f"veth-ext-{slice_id}"
-            dhcp_if = f"veth-int.{svlan}"
 
             Logger.info(f"Slice ID: {slice_id}")
             Logger.info(f"SVLAN: {svlan}")
@@ -1368,102 +1412,180 @@ class SliceManager:
             Logger.info(f"Namespace: {namespace_name}")
 
             try:
-                # 1. Verificar si namespace ya existe (evitar conflictos)
+                # 1. Verificar si namespace ya existe
                 result = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
                 if namespace_name in result.stdout:
                     Logger.warning(f"Namespace {namespace_name} ya existe, eliminando...")
                     os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
 
-                # 2. Configurar namespace y veth pair únicos
+                # 2. Configurar namespace y veth pair
                 Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
-
-                # Eliminar interfaces existentes si existen
                 os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
-
                 os.system(f"sudo ip netns add {namespace_name}")
                 os.system(f"sudo ip link add {veth_int_name} type veth peer name {veth_ext_name}")
                 os.system(f"sudo ip link set {veth_int_name} netns {namespace_name}")
 
-                # 3. Configurar interfaces
+                # 3. Configurar interfaces y asignar IP al veth interno
                 Logger.subsection("CONFIGURANDO INTERFACES")
                 os.system(f"sudo ip netns exec {namespace_name} ip link set {veth_int_name} up")
                 os.system(f"sudo ip netns exec {namespace_name} ip link set lo up")
+                os.system(f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {veth_int_name}")
                 os.system(f"sudo ip link set {veth_ext_name} up")
 
-                # Verificar que el bridge existe antes de agregar puerto
-                bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']],
-                                               capture_output=True)
+                # 4. Conectar a OVS y configurar VLAN tagging
+                Logger.subsection("CONFIGURANDO OVS Y VLAN")
+                bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']], 
+                                            capture_output=True)
                 if bridge_exists.returncode != 0:
                     Logger.warning(f"Bridge {NETWORK_CONFIG['headnode_br']} no existe, creándolo...")
                     os.system(f"sudo ovs-vsctl add-br {NETWORK_CONFIG['headnode_br']}")
 
                 os.system(f"sudo ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}")
+                os.system(f"sudo ovs-vsctl set port {veth_ext_name} tag={svlan}")
 
-                # 4. Conectar a OVS y configurar gateway
-                Logger.subsection("CONFIGURANDO OVS Y GATEWAY")
-
-                # Eliminar puerto existente si existe
+                # 5. Configurar gateway interface
+                Logger.subsection("CONFIGURANDO GATEWAY")
                 os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
-
                 os.system(f"sudo ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
                 os.system(f"sudo ovs-vsctl set interface {gateway_if} type=internal")
                 os.system(f"sudo ovs-vsctl set port {gateway_if} tag={svlan}")
                 os.system(f"sudo ip link set {gateway_if} up")
 
-                # Verificar si IP ya está asignada
+                # Verificar y asignar IP al gateway
                 ip_check = subprocess.run(['ip', 'addr', 'show', gateway_if], capture_output=True, text=True)
                 gateway_ip = network.replace('0/24', '1/24')
                 if gateway_ip.split('/')[0] not in ip_check.stdout:
                     os.system(f"sudo ip addr add {gateway_ip} dev {gateway_if}")
 
-                # 5. Configurar VLAN subinterface dentro del namespace
-                Logger.subsection("CONFIGURANDO VLAN SUBINTERFACE")
-                os.system(
-                    f"sudo ip netns exec {namespace_name} ip link add link {veth_int_name} name {dhcp_if} type vlan id {svlan}")
-                os.system(f"sudo ip netns exec {namespace_name} ip link set {dhcp_if} up")
-                os.system(
-                    f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {dhcp_if}")
+                # 6. Configurar DHCP
+                Logger.subsection("CONFIGURANDO DHCP")
+                dhcp_config = self._generate_dhcp_config(network_config, namespace_name,external_interfaces)
+                self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
 
-                # 6. Configurar NAT (verificar existencia antes de agregar)
-                Logger.subsection("CONFIGURANDO NAT Y FORWARDING")
+                # 7. Configurar NAT y forwarding en el host
                 nat_commands = [
-                    f"sudo ip netns exec {namespace_name} iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo ip netns exec {namespace_name} iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                    # NAT general para toda la red del slice
+                    f"sudo iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
                     f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
                     f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
                     "sudo sysctl -w net.ipv4.ip_forward=1"
                 ]
 
+                # Agregar reglas para acceso externo específico
+                ip_assignments = network_config.get('ip_assignments', {})
+                Logger.debug(f"Asignaciones IP: {json.dumps(ip_assignments, indent=2)}")
+
+                for mac, ips in ip_assignments.items():
+                    internal_ip = ips['internal_ip']
+                    external_ip = ips['external_ip']
+                    
+                    if external_ip:  # Solo si tiene IP externa asignada
+                        # NAT bidireccional para acceso externo
+                        nat_commands.extend([
+                            # DNAT para acceso desde exterior (10.60.11.0/24) hacia la VM
+                            f"sudo iptables -t nat -C PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip}",
+                            
+                            # SNAT para respuestas desde la VM hacia el exterior
+                            f"sudo iptables -t nat -C POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip}",
+                            
+                            # Permitir acceso desde el exterior
+                            f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT",
+                            
+                            # Permitir respuestas desde la VM
+                            f"sudo iptables -C FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT"
+                        ])
+                        
+                        Logger.debug(f"Configurado NAT bidireccional: {external_ip} <-> {internal_ip}")
+
+                # Ejecutar comandos NAT
                 for cmd in nat_commands:
                     Logger.debug(f"Ejecutando: {cmd}")
                     result = os.system(cmd)
                     if result != 0:
                         Logger.warning(f"Comando NAT falló: {cmd}")
 
-                # 7. Configurar DHCP
-                Logger.subsection("CONFIGURANDO DHCP")
-                dhcp_config = self._generate_dhcp_config(network_config, namespace_name)
-                self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
-
+                
                 Logger.success("Configuración de red completada exitosamente")
 
             except Exception as e:
                 Logger.error(f"Error en configuración de red: {str(e)}")
-                # Limpiar recursos parciales en caso de error
                 try:
                     os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
                     os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
                     os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
-                except:
-                    pass
-                raise
-    
-    def _generate_dhcp_config(self, network_config: dict, namespace_name: str) -> str:
+                except Exception as cleanup_error:
+                    Logger.warning(f"Error durante limpieza: {cleanup_error}")
+                raise Exception(f"Error en configuración de red: {str(e)}")
+
+    # def _generate_dhcp_config(self, network_config: dict, namespace_name: str) -> str:
+    #     """
+    #     Genera la configuración del servidor DHCP para el slice.
+        
+    #     Args:
+    #         network_config (dict): Configuración de red del slice
+    #         namespace_name (str): Nombre único del namespace para este slice
+
+    #     Returns:
+    #         str: Contenido del archivo de configuración DHCP
+    #     """
+    #     Logger.debug("Generando configuración DHCP")
+
+    #     network = network_config['network']
+    #     svlan = network_config['svlan_id']
+    #     range1 = network_config['dhcp_range'][0]
+    #     range2 = network_config['dhcp_range'][1]
+    #     dhcp_ip = network.replace('0/24', '2')
+    #     dhcp_if = network_config['dhcp_interface'] # veth-int-{slice_id}
+
+    #     # Definir rutas de archivos únicos por slice
+    #     log_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.log')
+    #     lease_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.leases')
+    #     pid_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.pid')
+
+    #     Logger.debug(f"Namespace: {namespace_name}")
+    #     Logger.debug(f"SVLAN: {svlan}")
+    #     Logger.debug(f"Red: {network}")
+    #     Logger.debug(f"Rango DHCP: {range1} - {range2}")
+    #     Logger.debug(f"IP DHCP: {dhcp_ip}")
+    #     Logger.debug(f"Interface DHCP: {dhcp_if}")
+        
+    #     # Generar configuración en una sola línea para cada opción
+    #     config = [
+    #         f"interface={dhcp_if}",
+    #         f"listen-address={dhcp_ip}",
+    #         "bind-interfaces",
+    #         "except-interface=lo",
+    #         "no-hosts",
+    #         "no-resolv",
+    #         f"dhcp-range={range1},{range2},255.255.255.0,12h",
+    #         f"dhcp-option=3,{network.replace('0/24', '1')}",  # Router
+    #         "dhcp-option=1,255.255.255.0",  # Netmask
+    #         f"dhcp-option=28,{network.rsplit('.', 1)[0]}.255",  # Broadcast
+    #         "dhcp-option=6,8.8.8.8,8.8.4.4",  # DNS Servers
+    #         f"log-facility={log_file}",
+    #         f"pid-file={pid_file}",
+    #         "dhcp-authoritative",
+    #         f"dhcp-leasefile={lease_file}",
+    #         "log-queries",  # Para debug
+    #         "log-dhcp"     # Para debug
+    #     ]
+            
+    #     # Unir configuración con saltos de línea
+    #     final_config = '\n'.join(config)
+        
+    #     Logger.debug("Configuración DHCP generada:")
+    #     Logger.debug(f"\n{final_config}")
+        
+    #     return final_config
+
+    def _generate_dhcp_config(self, network_config: dict, namespace_name: str, external_interfaces: list) -> str:
         """
         Genera la configuración del servidor DHCP para el slice.
         
         Args:
             network_config (dict): Configuración de red del slice
-            namespace_name (str): Nombre único del namespace para este slice
+            namespace_name (str): Nombre del namespace
+            external_interfaces (list): Lista de interfaces con acceso externo
 
         Returns:
             str: Contenido del archivo de configuración DHCP
@@ -1472,24 +1594,21 @@ class SliceManager:
 
         network = network_config['network']
         svlan = network_config['svlan_id']
-        range1 = network_config['dhcp_range'][0]
-        range2 = network_config['dhcp_range'][1]
         dhcp_ip = network.replace('0/24', '2')
-        dhcp_if = f"veth-int.{svlan}"
-
-        # Definir rutas de archivos únicos por slice
-        log_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.log')
-        lease_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.leases')
-        pid_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.pid')
+        dhcp_if = network_config['dhcp_interface']
 
         Logger.debug(f"Namespace: {namespace_name}")
         Logger.debug(f"SVLAN: {svlan}")
         Logger.debug(f"Red: {network}")
-        Logger.debug(f"Rango DHCP: {range1} - {range2}")
         Logger.debug(f"IP DHCP: {dhcp_ip}")
         Logger.debug(f"Interface DHCP: {dhcp_if}")
-        
-        # Generar configuración en una sola línea para cada opción
+
+        # Definir rutas de archivos
+        log_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.log')
+        lease_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.leases')
+        pid_file = os.path.join(DATA_DIR['dhcp']['log'], f'dnsmasq-{svlan}.pid')
+
+        # Configuración base
         config = [
             f"interface={dhcp_if}",
             f"listen-address={dhcp_ip}",
@@ -1497,7 +1616,6 @@ class SliceManager:
             "except-interface=lo",
             "no-hosts",
             "no-resolv",
-            f"dhcp-range={range1},{range2},255.255.255.0,12h",
             f"dhcp-option=3,{network.replace('0/24', '1')}",  # Router
             "dhcp-option=1,255.255.255.0",  # Netmask
             f"dhcp-option=28,{network.rsplit('.', 1)[0]}.255",  # Broadcast
@@ -1506,13 +1624,35 @@ class SliceManager:
             f"pid-file={pid_file}",
             "dhcp-authoritative",
             f"dhcp-leasefile={lease_file}",
-            "log-queries",  # Para debug
-            "log-dhcp"     # Para debug
+            "log-queries",
+            "log-dhcp"
         ]
-            
-        # Unir configuración con saltos de línea
+
+        # Asignar IPs fijas para interfaces externas
+        next_ip = 3
+        assigned_ips = {}
+        base_network = network.rsplit('.', 1)[0]
+
+        for interface in external_interfaces:
+            if interface.get('mac_address'):
+                internal_ip = f"{base_network}.{next_ip}"
+                config.append(f"dhcp-host={interface['mac_address']},{internal_ip}")
+                assigned_ips[interface['mac_address']] = {
+                    'internal_ip': internal_ip,
+                    'external_ip': interface.get('ip')  # IP del pool 10.60.11.0/24
+                }
+                next_ip += 1
+                Logger.debug(f"Asignación estática: MAC {interface['mac_address']} -> IP interna {internal_ip} -> IP externa {interface.get('ip')}")
+
+        # Configurar rango DHCP para el resto de interfaces
+
+        # Comenzar después de las IPs asignadas estáticamente
+        config.append(f"dhcp-range={base_network}.{next_ip},{base_network}.254,255.255.255.0,12h")
+
+        # Guardar las asignaciones para uso en la configuración de NAT
+        network_config['ip_assignments'] = assigned_ips
+
         final_config = '\n'.join(config)
-        
         Logger.debug("Configuración DHCP generada:")
         Logger.debug(f"\n{final_config}")
         
@@ -1580,182 +1720,6 @@ class SliceManager:
             Logger.error(f"Error aplicando configuración DHCP: {str(e)}")
             raise
 
-    def _start_vms(self, vms: list, slice_config: dict):
-        """
-        Inicia las VMs en sus respectivos workers.
-
-        Realiza el proceso completo de inicio:
-        1. Identifica y transfiere las imágenes necesarias a cada worker
-        2. Crea y configura las imágenes de VM
-        3. Inicia las VMs con QEMU/KVM
-        4. Limpia recursos temporales
-
-        Args:
-            vms (list): Lista de VMs a iniciar
-            slice_config (dict): Configuración completa del slice
-
-        Raises:
-            Exception: Si hay errores iniciando las VMs o en la limpieza
-        """
-        try:
-            Logger.section("INICIANDO VMs")
-            
-            # 1. Identificar imágenes necesarias por worker
-            Logger.info("Identificando imágenes necesarias")
-            worker_images = {}  # {worker_name: set(image_paths)}
-            
-            for vm in vms:
-                worker = vm['physical_server']['name']
-                image_path = self.resource_manager.get_image_path(vm['image_id'])
-                Logger.debug(f"VM ID-{vm['id']}: {image_path} -> {worker}")
-                
-                worker_images.setdefault(worker, set()).add(image_path)
-
-            # 2. Copiar imágenes base a workers
-            Logger.section("COPIANDO IMÁGENES A WORKERS")
-            for worker, images in worker_images.items():
-                Logger.subsection(f"Worker: {worker}")
-                with SSHManager(worker) as ssh:
-                    # Preparar directorio
-                    Logger.info("Configurando directorios...")
-                    ssh.execute(f"sudo mkdir -p {DATA_DIR['images']}")
-                    ssh.execute(f"sudo chmod 777 {DATA_DIR['images']}")
-                    
-                    # Transferir imágenes
-                    sftp = ssh.client.open_sftp()
-                    for image_path in images:
-                        base_name = os.path.basename(image_path)
-                        remote_path = f"{DATA_DIR['images']}/{base_name}"
-                        
-                        try:
-                            sftp.stat(remote_path)
-                            Logger.debug(f"Imagen {base_name} ya existe")
-                        except FileNotFoundError:
-                            Logger.info(f"Transfiriendo {base_name}...")
-                            sftp.put(image_path, remote_path)
-                    
-                    sftp.close()
-                    
-                    # Restaurar permisos
-                    ssh.execute(f"sudo chmod 755 {DATA_DIR['images']}")
-                    ssh.execute(f"sudo chown -R ubuntu:ubuntu {DATA_DIR['images']}")
-                    Logger.success(f"Imágenes copiadas a {worker}")
-
-            # 3. Crear y configurar VMs
-            Logger.section("CONFIGURANDO E INICIANDO VMs")
-            for vm in vms:
-                Logger.subsection(f"VM ID-{vm['id']} en {vm['physical_server']['name']}")
-                worker = vm['physical_server']['name']
-                
-                with SSHManager(worker) as ssh:
-                    # Obtener configuración
-                    flavor = self.resource_manager.get_flavor_config(vm['flavor_id'])
-                    base_image = os.path.basename(
-                        self.resource_manager.get_image_path(vm['image_id'])
-                    )
-                    
-                    # Preparar imagen
-                    vm_image = f"vm-{vm['id']}-slice-{slice_config['slice_info']['id']}.qcow2"
-                    vm_image_path = os.path.join(DATA_DIR['images'], vm_image)
-                    
-                    Logger.info("Preparando imagen...")
-                    Logger.debug(f"Base: {base_image}")
-                    Logger.debug(f"Destino: {vm_image_path}")
-                    Logger.debug(f"Tamaño: {flavor['disk']} GB")
-
-                    # Copiar y redimensionar
-                    disk_size_mb = int(flavor['disk'] * 1024)
-
-                    ssh.execute(f"sudo cp {DATA_DIR['images']}/{base_image} {vm_image_path}")
-                    ssh.execute(f"sudo qemu-img resize --shrink {vm_image_path} {disk_size_mb}M")
-                    
-                    stdout, _ = ssh.execute(f"sudo qemu-img info {vm_image_path}")
-                    Logger.debug(f"Información de imagen:\n{stdout}")
-
-                    # Construir comando QEMU
-                    cmd = [
-                        "sudo qemu-system-x86_64",
-                        "-enable-kvm",
-                        f"-name guest=VM{vm['id']}-S{slice_config['slice_info']['id']}",
-                        f"-m {flavor['ram']}",
-                        f"-smp {flavor['vcpus']}",
-                        f"-drive file={vm_image_path},format=qcow2",
-                        f"-vnc 0.0.0.0:{vm['vnc_display']}",
-                        "-daemonize"
-                    ]
-
-                    # Configurar interfaces
-                    vm_interfaces = [
-                        i for i in slice_config['topology_info']['interfaces']
-                        if i['vm_id'] == vm['id']
-                    ]
-                    vm_interfaces.sort(key=lambda x: not x['external_access'])
-                    
-                    Logger.info("Configurando interfaces...")
-                    for interface in vm_interfaces:
-                        tap_name = interface['tap_name']
-                        cmd.extend([
-                            f"-netdev tap,id={tap_name},ifname={tap_name},script=no,downscript=no",
-                            f"-device e1000,netdev={tap_name},mac={interface['mac_address']}"
-                        ])
-                        Logger.debug(f"Interface: {tap_name}, MAC: {interface['mac_address']}")
-
-                    # Iniciar VM
-                    Logger.info("Ejecutando QEMU...")
-                    Logger.debug(f"Comando: {' '.join(cmd)}")
-                    
-                    stdout, stderr = ssh.execute(' '.join(cmd))
-                    if stderr:
-                        Logger.warning(f"QEMU stderr: {stderr}")
-
-                    # Verificar estado
-                    time.sleep(2)
-                    stdout, _ = ssh.execute(
-                        f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
-                    )
-                    
-                    if stdout.strip():
-                        vm['qemu_pid'] = int(stdout.strip())
-                        Logger.success(f"VM ID-{vm['id']} iniciada con PID {vm['qemu_pid']}")
-                    else:
-                        raise Exception(
-                            f"No se pudo obtener PID de QEMU para VM {vm['id']}"
-                        )
-
-            # 4. Limpiar imágenes base
-            Logger.section("LIMPIANDO RECURSOS TEMPORALES")
-            for worker, images in worker_images.items():
-                with SSHManager(worker) as ssh:
-                    for image_path in images:
-                        base_name = os.path.basename(image_path)
-                        Logger.debug(f"Limpiando {base_name} de {worker}")
-                        ssh.execute(f"sudo rm -f {DATA_DIR['images']}/{base_name}")
-            
-            Logger.success("Inicio de VMs completado exitosamente")
-
-        except Exception as e:
-            Logger.error(f"Error iniciando VMs: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            
-            # Intentar limpiar recursos
-            Logger.section("INICIANDO LIMPIEZA POR ERROR")
-            for worker, images in worker_images.items():
-                try:
-                    with SSHManager(worker) as ssh:
-                        Logger.info(f"Limpiando recursos en {worker}...")
-                        # Limpiar imágenes base
-                        for image_path in images:
-                            base_name = os.path.basename(image_path)
-                            ssh.execute(f"sudo rm -f {DATA_DIR['images']}/{base_name}")
-                        # Limpiar imágenes de VM
-                        ssh.execute(f"sudo rm -f {DATA_DIR['images']}/vm-*-slice-*.qcow2")
-                except Exception as cleanup_error:
-                    Logger.warning(
-                        f"Error durante limpieza en {worker}: {str(cleanup_error)}"
-                    )
-            
-            raise Exception(f"Error iniciando VMs: {str(e)}")
-
     def stop_slice(self, slice_id: int, request_data: dict) -> tuple:
         """
         Detiene todas las VMs de un slice y limpia sus recursos.
@@ -1791,7 +1755,7 @@ class SliceManager:
 
             # Generar nombres únicos del slice
             namespace_name = f"ns-slice-{slice_id}"
-            veth_int_name = f"veth-int-{slice_id}"
+            veth_int_name = network_config['dhcp_interface']  # veth-int-{slice_id}
             veth_ext_name = f"veth-ext-{slice_id}"
 
             # Matar dnsmasq específico del slice (SIN CAMBIOS)
@@ -1825,7 +1789,6 @@ class SliceManager:
             # 3. Eliminar interfaces dentro del namespace
             Logger.info(f"Eliminando namespace {namespace_name}...")
             ns_cleanup_commands = [
-                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
                 f"sudo ip netns del {namespace_name} 2>/dev/null || true"
             ]
             for cmd in ns_cleanup_commands:
@@ -1834,13 +1797,39 @@ class SliceManager:
             # 4. Limpiar reglas de iptables y forwarding
             Logger.info("Limpiando reglas de red específicas...")
             cleanup_commands = [
+                # NAT general para toda la red del slice
                 f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || true",
                 f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || true",
-                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true",
-                "sudo sysctl -w net.ipv4.ip_forward=1"
+                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true"
             ]
+
+            # Limpiar reglas NAT para interfaces con acceso externo
+            for interface in request_data.get('interfaces', []):
+                if interface.get('external_access') and interface.get('ip'):
+                    external_ip = interface['ip']
+                    # Obtener IP interna basada en la numeración secuencial desde .3
+                    internal_ip = f"{network.rsplit('.', 1)[0]}.{3 + len(cleanup_commands) - 3}"  # Empezar desde .3
+                    
+                    cleanup_commands.extend([
+                        # Eliminar reglas DNAT
+                        f"sudo iptables -t nat -D PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || true",
+                        
+                        # Eliminar reglas SNAT
+                        f"sudo iptables -t nat -D POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || true",
+                        
+                        # Eliminar reglas FORWARD
+                        f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || true",
+                        f"sudo iptables -D FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || true"
+                    ])
+                    Logger.debug(f"Limpiando NAT para {external_ip} <-> {internal_ip}")
+
+            # Ejecutar comandos de limpieza
             for cmd in cleanup_commands:
-                os.system(cmd)
+                try:
+                    Logger.debug(f"Ejecutando: {cmd}")
+                    os.system(cmd)
+                except Exception as e:
+                    Logger.warning(f"Error en comando de limpieza: {str(e)}")
 
             # 5. Limpiar configuración DHCP
             Logger.info("Limpiando configuración DHCP específica...")
@@ -2501,7 +2490,10 @@ class SliceManager:
                 slice_bridge = network_config['slice_bridge_name']
                 patch_slice = network_config['patch_ports']['slice_side']
                 patch_int = network_config['patch_ports']['int_side']
-                dhcp_if = network_config['dhcp_interface']
+                slice_id = slice_config['slice_info']['id']
+                namespace_name = f"ns-slice-{slice_id}"
+                veth_int_name = network_config['dhcp_interface']
+                veth_ext_name = f"veth-ext-{slice_id}"
                 gateway_if = network_config['gateway_interface']
 
                 # Orden de limpieza (de más crítico a menos crítico)
@@ -2628,12 +2620,6 @@ class SliceManager:
                     if stage == 'network' or stage == 'init':
                         Logger.info("Limpiando configuración inicial de red y DHCP...")
                         try:
-                            # Obtener identificadores únicos del slice
-                            slice_id = slice_config['slice_info']['id']
-                            namespace_name = f"ns-slice-{slice_id}"
-                            veth_int_name = f"veth-int-{slice_id}"
-                            veth_ext_name = f"veth-ext-{slice_id}"
-
                             # Matar dnsmasq específico del slice
                             cmd = f"pgrep -f 'dnsmasq.{svlan}.conf'"
                             try:
@@ -2656,7 +2642,6 @@ class SliceManager:
                             # Limpiar namespace específico del slice
                             Logger.info(f"Eliminando namespace {namespace_name}...")
                             ns_cleanup_commands = [
-                                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
                                 f"sudo ip netns del {namespace_name} 2>/dev/null || true"
                             ]
                             for cmd in ns_cleanup_commands:
@@ -2671,25 +2656,43 @@ class SliceManager:
                             for cmd in host_cleanup_commands:
                                 os.system(cmd)
 
-                            # Limpiar namespace específico del slice
-                            Logger.info(f"Eliminando namespace {namespace_name}...")
-                            ns_cleanup_commands = [
-                                f"sudo ip netns exec {namespace_name} ip link del veth-int.{svlan} 2>/dev/null || true",
-                                f"sudo ip netns del {namespace_name} 2>/dev/null || true"
-                            ]
-                            for cmd in ns_cleanup_commands:
-                                os.system(cmd)
-
                             # Limpiar reglas de iptables y forwarding específicas del slice
                             Logger.info("Limpiando reglas de red específicas...")
                             cleanup_commands = [
+                                # NAT general para toda la red del slice
                                 f"sudo iptables -t nat -D POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || true",
                                 f"sudo iptables -D FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || true",
-                                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true",
-                                "sudo sysctl -w net.ipv4.ip_forward=1"
+                                f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true"
                             ]
+
+                            # Limpiar reglas NAT para interfaces con acceso externo
+                            ip_assignments = network_config.get('ip_assignments', {})
+                            if ip_assignments:
+                                Logger.info("Limpiando reglas NAT para interfaces con acceso externo...")
+                                for mac, ips in ip_assignments.items():
+                                    internal_ip = ips['internal_ip']
+                                    external_ip = ips['external_ip']
+                                    if external_ip:
+                                        cleanup_commands.extend([
+                                            # Eliminar reglas DNAT
+                                            f"sudo iptables -t nat -D PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || true",
+                                            
+                                            # Eliminar reglas SNAT
+                                            f"sudo iptables -t nat -D POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || true",
+                                            
+                                            # Eliminar reglas FORWARD
+                                            f"sudo iptables -D FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || true",
+                                            f"sudo iptables -D FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || true"
+                                        ])
+                                        Logger.debug(f"Limpiando NAT para {external_ip} <-> {internal_ip}")
+
+                            # Ejecutar comandos de limpieza
                             for cmd in cleanup_commands:
-                                os.system(cmd)
+                                try:
+                                    Logger.debug(f"Ejecutando: {cmd}")
+                                    os.system(cmd)
+                                except Exception as e:
+                                    Logger.warning(f"Error en comando de limpieza: {str(e)}")
 
                             # Limpiar configuración DHCP específica del slice
                             Logger.info("Limpieza final de configuración DHCP...")
