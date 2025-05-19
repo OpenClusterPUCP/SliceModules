@@ -1779,7 +1779,7 @@ class SliceManager:
 
             # Limpieza en el HeadNode
 
-            # Obtener información del salice
+            # Obtener información del slice
             network_config = request_data['network_config']
             svlan = network_config['svlan_id']
             network = network_config['network']
