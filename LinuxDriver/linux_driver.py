@@ -202,6 +202,24 @@ cleanup_lock = threading.RLock()
 # Lock para operaciones en OVS (evita comandos ovs-vsctl simultáneos)
 ovs_lock = threading.RLock()
 
+# NUEVO: Locks por worker para evitar conflictos de SSH y configuración simultanea
+worker_locks = {
+    'Worker 1': threading.RLock(),
+    'Worker 2': threading.RLock(),
+    'Worker 3': threading.RLock()
+}
+
+# NUEVO: Lock para operaciones en el mismo SVLAN (evita conflictos de bridge con mismo nombre)
+svlan_locks = {}
+svlan_locks_lock = threading.RLock()
+
+def get_svlan_lock(svlan_id):
+    """Obtiene el lock para un SVLAN específico"""
+    with svlan_locks_lock:
+        if svlan_id not in svlan_locks:
+            svlan_locks[svlan_id] = threading.RLock()
+        return svlan_locks[svlan_id]
+
 # ===================== CONFIGURACIÓN BD =====================
 DB_CONFIG = {
     "host": "10.0.10.4",
@@ -250,9 +268,9 @@ KAFKA_TOPICS = {
 }
 
 # Cola compartida de operaciones por SliceId para mantener orden FIFO
-slice_operation_queues = {}
-slice_operation_locks = {}
-slice_queue_lock = threading.RLock()
+# slice_operation_queues = {}
+# slice_operation_locks = {}
+# slice_queue_lock = threading.RLock()
 
 # Estado global de consumidores
 consumers_running = True
@@ -778,105 +796,112 @@ class SliceManager:
             self._cleanup_deployment_state(slice_config, current_stage)
             raise Exception(error_msg)
 
-    def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict, 
-                    results: dict, errors: dict):
+    def _worker_setup(self, worker_info: dict, vms: list, slice_config: dict,
+                      results: dict, errors: dict):
         """
         Configura un worker específico para el despliegue de sus VMs asignadas.
-        
-        La configuración se realiza en dos fases:
-        1. Serie: Configuración de red (bridges y TAPs)
-        2. Paralelo: Inicio de VMs usando múltiples conexiones SSH
+        VERSIÓN CON LOCKS PARA EVITAR CONFLICTOS SSH Y CONFIGURACIÓN SIMULTANEA
         """
-        try:
-            Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
-            Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
-            Logger.info(f"VMs a configurar: {len(vms)}")
+        worker_name = worker_info['name']
+        worker_lock = worker_locks.get(worker_name, threading.RLock())  # Usar lock por worker
 
-            ssh_info = {
-                'name': worker_info['name'],
-                'ip': worker_info['ip'],
-                'ssh_username': worker_info['ssh_username'],
-                'ssh_password': worker_info.get('ssh_password'),
-                'ssh_key_path': worker_info.get('ssh_key_path')
-            }
+        # 🔥 USAR LOCK POR WORKER PARA EVITAR CONFLICTOS SSH SIMULTÁNEOS
+        with worker_lock:
+            try:
+                Logger.subsection(f"CONFIGURANDO WORKER ID-{worker_info['id']}")
+                Logger.debug(f"Worker info: {json.dumps(worker_info, indent=2)}")
+                Logger.info(f"VMs a configurar: {len(vms)}")
 
-            # FASE 1: Configuración de red (en serie)
-            with SSHManager(ssh_info) as ssh:
-                # 1. Configuración de bridges
-                Logger.info(f"Configurando bridges en {worker_info['name']}...")
-                bridge_commands = self._generate_bridge_commands(slice_config['network_config'])
-                Logger.debug(f"Comandos bridge: {' && '.join(bridge_commands)}")
-                ssh.execute(" && ".join(bridge_commands))
-                
-                # 2. Configuración de interfaces TAP
-                Logger.info(f"Configurando interfaces TAP en {worker_info['name']}...")
-                tap_commands = self._generate_tap_commands(vms, slice_config)
-                if tap_commands:
-                    Logger.debug(f"Ejecutando comandos TAP: {' && '.join(tap_commands)}")
-                    ssh.execute(" && ".join(tap_commands))
+                ssh_info = {
+                    'name': worker_info['name'],
+                    'ip': worker_info['ip'],
+                    'ssh_username': worker_info['ssh_username'],
+                    'ssh_password': worker_info.get('ssh_password'),
+                    'ssh_key_path': worker_info.get('ssh_key_path')
+                }
 
-            # FASE 2: Inicio paralelo de VMs
-            vm_threads = []
-            vm_results_dict = {}
-            vm_errors_dict = {}
-            thread_lock = threading.Lock()
+                # FASE 1: Configuración de red (en serie dentro del worker)
+                with SSHManager(ssh_info) as ssh:
+                    # 1. Configuración de bridges - CON LOCK OVS
+                    Logger.info(f"Configurando bridges en {worker_info['name']}...")
+                    bridge_commands = self._generate_bridge_commands(slice_config['network_config'])
+                    Logger.debug(f"Comandos bridge: {' && '.join(bridge_commands)}")
 
-            def start_vm_thread(vm):
-                try:
-                    with SSHManager(ssh_info) as vm_ssh:
-                        Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
-                        self._start_single_vm(vm_ssh, vm, slice_config)
-                        
-                        # Verificar estado
-                        stdout, _ = vm_ssh.execute(
-                            f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
-                        )
-                        if stdout.strip():
-                            qemu_pid = int(stdout.split()[0])
-                            Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
-                            with thread_lock:
-                                vm_results_dict[vm['id']] = {
-                                    'id': vm['id'],
-                                    'qemu_pid': qemu_pid,
-                                    'status': 'running'
-                                }
-                except Exception as e:
-                    error_msg = f"Error iniciando VM ID-{vm['id']}: {str(e)}"
-                    Logger.error(error_msg)
-                    with thread_lock:
-                        vm_errors_dict[vm['id']] = error_msg
+                    # 🔥 USAR LOCK OVS PARA COMANDOS REMOTOS TAMBIÉN
+                    with ovs_lock:
+                        ssh.execute(" && ".join(bridge_commands))
 
-            # Crear y comenzar threads para cada VM
-            for vm in vms:
-                thread = threading.Thread(target=start_vm_thread, args=(vm,))
-                vm_threads.append(thread)
-                thread.start()
+                    # 2. Configuración de interfaces TAP - CON LOCK OVS
+                    Logger.info(f"Configurando interfaces TAP en {worker_info['name']}...")
+                    tap_commands = self._generate_tap_commands(vms, slice_config)
+                    if tap_commands:
+                        Logger.debug(f"Ejecutando comandos TAP: {' && '.join(tap_commands)}")
+                        with ovs_lock:
+                            ssh.execute(" && ".join(tap_commands))
 
-            # Esperar a que todos los threads terminen
-            for thread in vm_threads:
-                thread.join()
+                # FASE 2: Inicio paralelo de VMs (solo dentro del mismo worker)
+                vm_threads = []
+                vm_results_dict = {}
+                vm_errors_dict = {}
+                thread_lock = threading.Lock()
 
-            # Procesar resultados
-            if vm_errors_dict:
-                error_messages = [f"VM ID-{vm_id}: {error}" 
-                                for vm_id, error in vm_errors_dict.items()]
-                raise Exception("Errores iniciando VMs:\n" + "\n".join(error_messages))
+                def start_vm_thread(vm):
+                    try:
+                        # Crear nueva conexión SSH para cada VM thread
+                        with SSHManager(ssh_info) as vm_ssh:
+                            Logger.info(f"Iniciando VM ID-{vm['id']} en {worker_info['name']}...")
+                            self._start_single_vm(vm_ssh, vm, slice_config)
 
-            results[worker_info['name']] = {
-                'success': True,
-                'vms': list(vm_results_dict.values())
-            }
-            Logger.success(f"Configuración de {worker_info['name']} completada")
+                            # Verificar estado
+                            stdout, _ = vm_ssh.execute(
+                                f"pgrep -fa 'guest=VM{vm['id']}-S{slice_config['slice_info']['id']}'"
+                            )
+                            if stdout.strip():
+                                qemu_pid = int(stdout.split()[0])
+                                Logger.success(f"VM ID-{vm['id']} iniciada con PID {qemu_pid}")
+                                with thread_lock:
+                                    vm_results_dict[vm['id']] = {
+                                        'id': vm['id'],
+                                        'qemu_pid': qemu_pid,
+                                        'status': 'running'
+                                    }
+                    except Exception as e:
+                        error_msg = f"Error iniciando VM ID-{vm['id']}: {str(e)}"
+                        Logger.error(error_msg)
+                        with thread_lock:
+                            vm_errors_dict[vm['id']] = error_msg
 
-        except Exception as e:
-            error_msg = f"Error en worker {worker_info['name']}: {str(e)}"
-            Logger.error(error_msg)
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            errors[worker_info['name']] = str(e)
-            results[worker_info['name']] = {
-                'success': False,
-                'error': str(e)
-            }
+                # Crear y comenzar threads para cada VM (paralelismo dentro del worker)
+                for vm in vms:
+                    thread = threading.Thread(target=start_vm_thread, args=(vm,))
+                    vm_threads.append(thread)
+                    thread.start()
+
+                # Esperar a que todos los threads terminen
+                for thread in vm_threads:
+                    thread.join()
+
+                # Procesar resultados
+                if vm_errors_dict:
+                    error_messages = [f"VM ID-{vm_id}: {error}"
+                                      for vm_id, error in vm_errors_dict.items()]
+                    raise Exception("Errores iniciando VMs:\n" + "\n".join(error_messages))
+
+                results[worker_info['name']] = {
+                    'success': True,
+                    'vms': list(vm_results_dict.values())
+                }
+                Logger.success(f"Configuración de {worker_info['name']} completada")
+
+            except Exception as e:
+                error_msg = f"Error en worker {worker_info['name']}: {str(e)}"
+                Logger.error(error_msg)
+                Logger.debug(f"Traceback: {traceback.format_exc()}")
+                errors[worker_info['name']] = str(e)
+                results[worker_info['name']] = {
+                    'success': False,
+                    'error': str(e)
+                }
 
     def _generate_bridge_commands(self, network_config: dict) -> list:
         """
@@ -1392,18 +1417,23 @@ class SliceManager:
                 - gateway_interface: Nombre interfaz gateway
             external_interfaces (list): Lista de interfaces con acceso externo
         """
-        with network_setup_lock:
+
+        slice_id = network_config['slice_id']
+        svlan = network_config['svlan_id']
+
+        # USAR LOCK POR SVLAN (cada slice tiene su SVLAN único)
+        svlan_lock = get_svlan_lock(svlan)
+
+        with svlan_lock:
             Logger.section("CONFIGURANDO ACCESO A INTERNET")
 
             # Extraer información base
-            slice_id = network_config['slice_id']
-            svlan = network_config['svlan_id']
             network = network_config['network']
             gateway_if = network_config['gateway_interface']
 
             # Generar nombres únicos por slice
             namespace_name = f"ns-slice-{slice_id}"
-            veth_int_name = network_config['dhcp_interface'] # veth-int-{slice_id}
+            veth_int_name = network_config['dhcp_interface']  # veth-int-{slice_id}
             veth_ext_name = f"veth-ext-{slice_id}"
 
             Logger.info(f"Slice ID: {slice_id}")
@@ -1411,31 +1441,33 @@ class SliceManager:
             Logger.info(f"Red: {network}")
             Logger.info(f"Namespace: {namespace_name}")
 
-            try:
-                # 1. Verificar si namespace ya existe
-                result = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
-                if namespace_name in result.stdout:
-                    Logger.warning(f"Namespace {namespace_name} ya existe, eliminando...")
-                    os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
+        try:
+            # 1. Verificar si namespace ya existe
+            result = subprocess.run(['ip', 'netns', 'list'], capture_output=True, text=True)
+            if namespace_name in result.stdout:
+                Logger.warning(f"Namespace {namespace_name} ya existe, eliminando...")
+                os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
 
-                # 2. Configurar namespace y veth pair
-                Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
-                os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
-                os.system(f"sudo ip netns add {namespace_name}")
-                os.system(f"sudo ip link add {veth_int_name} type veth peer name {veth_ext_name}")
-                os.system(f"sudo ip link set {veth_int_name} netns {namespace_name}")
+            # 2. Configurar namespace y veth pair
+            Logger.subsection("CONFIGURANDO NAMESPACE Y VETH PAIR")
+            os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
+            os.system(f"sudo ip netns add {namespace_name}")
+            os.system(f"sudo ip link add {veth_int_name} type veth peer name {veth_ext_name}")
+            os.system(f"sudo ip link set {veth_int_name} netns {namespace_name}")
 
-                # 3. Configurar interfaces y asignar IP al veth interno
-                Logger.subsection("CONFIGURANDO INTERFACES")
-                os.system(f"sudo ip netns exec {namespace_name} ip link set {veth_int_name} up")
-                os.system(f"sudo ip netns exec {namespace_name} ip link set lo up")
-                os.system(f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {veth_int_name}")
-                os.system(f"sudo ip link set {veth_ext_name} up")
+            # 3. Configurar interfaces y asignar IP al veth interno
+            Logger.subsection("CONFIGURANDO INTERFACES")
+            os.system(f"sudo ip netns exec {namespace_name} ip link set {veth_int_name} up")
+            os.system(f"sudo ip netns exec {namespace_name} ip link set lo up")
+            os.system(
+                f"sudo ip netns exec {namespace_name} ip addr add {network.replace('0/24', '2/24')} dev {veth_int_name}")
+            os.system(f"sudo ip link set {veth_ext_name} up")
 
-                # 4. Conectar a OVS y configurar VLAN tagging
-                Logger.subsection("CONFIGURANDO OVS Y VLAN")
-                bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']], 
-                                            capture_output=True)
+            # 4. Conectar a OVS y configurar VLAN tagging - CON LOCK OVS
+            Logger.subsection("CONFIGURANDO OVS Y VLAN")
+            with ovs_lock:  # 🔥 PREVENIR COMANDOS OVS SIMULTÁNEOS
+                bridge_exists = subprocess.run(['sudo', 'ovs-vsctl', 'br-exists', NETWORK_CONFIG['headnode_br']],
+                                               capture_output=True)
                 if bridge_exists.returncode != 0:
                     Logger.warning(f"Bridge {NETWORK_CONFIG['headnode_br']} no existe, creándolo...")
                     os.system(f"sudo ovs-vsctl add-br {NETWORK_CONFIG['headnode_br']}")
@@ -1443,79 +1475,79 @@ class SliceManager:
                 os.system(f"sudo ovs-vsctl add-port {NETWORK_CONFIG['headnode_br']} {veth_ext_name}")
                 os.system(f"sudo ovs-vsctl set port {veth_ext_name} tag={svlan}")
 
-                # 5. Configurar gateway interface
-                Logger.subsection("CONFIGURANDO GATEWAY")
+            # 5. Configurar gateway interface - CON LOCK OVS
+            Logger.subsection("CONFIGURANDO GATEWAY")
+            with ovs_lock:  # 🔥 PREVENIR COMANDOS OVS SIMULTÁNEOS
                 os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
                 os.system(f"sudo ovs-vsctl --may-exist add-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
                 os.system(f"sudo ovs-vsctl set interface {gateway_if} type=internal")
                 os.system(f"sudo ovs-vsctl set port {gateway_if} tag={svlan}")
                 os.system(f"sudo ip link set {gateway_if} up")
 
-                # Verificar y asignar IP al gateway
-                ip_check = subprocess.run(['ip', 'addr', 'show', gateway_if], capture_output=True, text=True)
-                gateway_ip = network.replace('0/24', '1/24')
-                if gateway_ip.split('/')[0] not in ip_check.stdout:
-                    os.system(f"sudo ip addr add {gateway_ip} dev {gateway_if}")
+            # Verificar y asignar IP al gateway
+            ip_check = subprocess.run(['ip', 'addr', 'show', gateway_if], capture_output=True, text=True)
+            gateway_ip = network.replace('0/24', '1/24')
+            if gateway_ip.split('/')[0] not in ip_check.stdout:
+                os.system(f"sudo ip addr add {gateway_ip} dev {gateway_if}")
 
-                # 6. Configurar DHCP
-                Logger.subsection("CONFIGURANDO DHCP")
-                dhcp_config = self._generate_dhcp_config(network_config, namespace_name,external_interfaces)
-                self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
+            # 6. Configurar DHCP
+            Logger.subsection("CONFIGURANDO DHCP")
+            dhcp_config = self._generate_dhcp_config(network_config, namespace_name, external_interfaces)
+            self._apply_dhcp_config(dhcp_config, svlan, namespace_name)
 
-                # 7. Configurar NAT y forwarding en el host
-                nat_commands = [
-                    # NAT general para toda la red del slice
-                    f"sudo iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
-                    f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
-                    f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
-                    "sudo sysctl -w net.ipv4.ip_forward=1"
-                ]
+            # 7. Configurar NAT y forwarding en el host
+            nat_commands = [
+                # NAT general para toda la red del slice
+                f"sudo iptables -t nat -C POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {network} -o {NETWORK_CONFIG['internet_interface']} -j MASQUERADE",
+                f"sudo iptables -C FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {gateway_if} -o {NETWORK_CONFIG['internet_interface']} -s {network} -j ACCEPT",
+                f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -o {gateway_if} -d {network} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                "sudo sysctl -w net.ipv4.ip_forward=1"
+            ]
 
-                # Agregar reglas para acceso externo específico
-                ip_assignments = network_config.get('ip_assignments', {})
-                Logger.debug(f"Asignaciones IP: {json.dumps(ip_assignments, indent=2)}")
+            # Agregar reglas para acceso externo específico
+            ip_assignments = network_config.get('ip_assignments', {})
+            Logger.debug(f"Asignaciones IP: {json.dumps(ip_assignments, indent=2)}")
 
-                for mac, ips in ip_assignments.items():
-                    internal_ip = ips['internal_ip']
-                    external_ip = ips['external_ip']
-                    
-                    if external_ip:  # Solo si tiene IP externa asignada
-                        # NAT bidireccional para acceso externo
-                        nat_commands.extend([
-                            # DNAT para acceso desde exterior (10.60.11.0/24) hacia la VM
-                            f"sudo iptables -t nat -C PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip}",
-                            
-                            # SNAT para respuestas desde la VM hacia el exterior
-                            f"sudo iptables -t nat -C POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip}",
-                            
-                            # Permitir acceso desde el exterior
-                            f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT",
-                            
-                            # Permitir respuestas desde la VM
-                            f"sudo iptables -C FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT"
-                        ])
-                        
-                        Logger.debug(f"Configurado NAT bidireccional: {external_ip} <-> {internal_ip}")
+            for mac, ips in ip_assignments.items():
+                internal_ip = ips['internal_ip']
+                external_ip = ips['external_ip']
 
-                # Ejecutar comandos NAT
-                for cmd in nat_commands:
-                    Logger.debug(f"Ejecutando: {cmd}")
-                    result = os.system(cmd)
-                    if result != 0:
-                        Logger.warning(f"Comando NAT falló: {cmd}")
+                if external_ip:  # Solo si tiene IP externa asignada
+                    # NAT bidireccional para acceso externo
+                    nat_commands.extend([
+                        # DNAT para acceso desde exterior (10.60.11.0/24) hacia la VM
+                        f"sudo iptables -t nat -C PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip} 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {NETWORK_CONFIG['internet_interface']} -d {external_ip} -j DNAT --to-destination {internal_ip}",
 
-                
-                Logger.success("Configuración de red completada exitosamente")
+                        # SNAT para respuestas desde la VM hacia el exterior
+                        f"sudo iptables -t nat -C POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip} 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j SNAT --to-source {external_ip}",
 
-            except Exception as e:
-                Logger.error(f"Error en configuración de red: {str(e)}")
-                try:
-                    os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
-                    os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
-                    os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
-                except Exception as cleanup_error:
-                    Logger.warning(f"Error durante limpieza: {cleanup_error}")
-                raise Exception(f"Error en configuración de red: {str(e)}")
+                        # Permitir acceso desde el exterior
+                        f"sudo iptables -C FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i {NETWORK_CONFIG['internet_interface']} -d {internal_ip} -j ACCEPT",
+
+                        # Permitir respuestas desde la VM
+                        f"sudo iptables -C FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s {internal_ip} -o {NETWORK_CONFIG['internet_interface']} -j ACCEPT"
+                    ])
+
+                    Logger.debug(f"Configurado NAT bidireccional: {external_ip} <-> {internal_ip}")
+
+            # Ejecutar comandos NAT
+            for cmd in nat_commands:
+                Logger.debug(f"Ejecutando: {cmd}")
+                result = os.system(cmd)
+                if result != 0:
+                    Logger.warning(f"Comando NAT falló: {cmd}")
+
+            Logger.success("Configuración de red completada exitosamente")
+
+        except Exception as e:
+            Logger.error(f"Error en configuración de red: {str(e)}")
+            try:
+                os.system(f"sudo ip netns del {namespace_name} 2>/dev/null || true")
+                os.system(f"sudo ip link del {veth_ext_name} 2>/dev/null || true")
+                os.system(f"sudo ovs-vsctl --if-exists del-port {NETWORK_CONFIG['headnode_br']} {gateway_if}")
+            except Exception as cleanup_error:
+                Logger.warning(f"Error durante limpieza: {cleanup_error}")
+            raise Exception(f"Error en configuración de red: {str(e)}")
     
     # def _generate_dhcp_config(self, network_config: dict, namespace_name: str) -> str:
     #     """
@@ -3342,7 +3374,10 @@ class KafkaProcessor:
                         partition = msg.partition()
                         offset = msg.offset()
                         payload = json.loads(msg.value().decode('utf-8'))
+                        slice_id = payload.get('payload', {}).get('slice_info', {}).get('id')
                         operation_id = payload.get('id')
+
+                        Logger.debug(f"Operación {operation_id} (Slice {slice_id}) -> Partición {partition}")
 
                         # Crear identificador único del mensaje
                         message_id = f"{config['name']}-{partition}-{offset}-{operation_id}"
@@ -3400,6 +3435,7 @@ class KafkaProcessor:
     def _worker_thread(self, priority, partition, message_queue):
         """
         Hilo trabajador para procesar mensajes de una partición específica.
+        Versión optimizada para paralelismo completo.
 
         Args:
             priority: Nivel de prioridad (HIGH, MEDIUM, LOW)
@@ -3412,7 +3448,7 @@ class KafkaProcessor:
         # Procesamiento de mensajes
         while not self.exit_flag.is_set():
             try:
-                # Obtener mensaje (con timeout para permitir verificación de exit_flag)
+                # Obtener mensaje de Kafka
                 try:
                     message = message_queue.get(timeout=1.0)
                 except queue.Empty:
@@ -3427,14 +3463,28 @@ class KafkaProcessor:
                 message_metadata = message.get('_kafka_metadata', {})
                 Logger.debug(f"🔍 Worker: {thread_name}, Metadata: {message_metadata}")
 
-                # Solo actualizar estado una vez
-                # Verificar orden de operaciones para el mismo slice
-                if slice_id is not None:
-                    self._process_in_order(message, priority, partition, thread_name)
+                # 🔥 PROCESAMIENTO COMPLETAMENTE PARALELO 🔥
+                # Eliminamos TODAS las colas internas y locks por slice
+                # Cada worker thread procesa su mensaje independientemente
+
+                # Actualizar estado inmediatamente
+                self._update_operation_status(message, "PROCESSING")
+
+                # Procesar según el tipo de operación
+                if operation_type == "DEPLOY_SLICE":
+                    self._process_deploy_slice_direct(message, thread_name)
+                elif operation_type == "STOP_SLICE":
+                    self._process_stop_slice_direct(message, thread_name)
+                elif operation_type == "RESTART_SLICE":
+                    self._process_restart_slice_direct(message, thread_name)
                 else:
-                    # Solo para operaciones sin slice_id
-                    self._update_operation_status(message, "PROCESSING")
-                    self._process_operation(message)
+                    # Para tipos de operación no implementados
+                    Logger.warning(f"Tipo de operación no implementado: {operation_type}")
+                    self._update_operation_status(
+                        message,
+                        "ERROR",
+                        error_message=f"Tipo de operación no implementado: {operation_type}"
+                    )
 
                 # Marcar mensaje como completado
                 message_queue.task_done()
@@ -3443,161 +3493,119 @@ class KafkaProcessor:
                 if not self.exit_flag.is_set():
                     Logger.error(f"Error en trabajador {thread_name}: {str(e)}")
                     Logger.debug(f"Traceback: {traceback.format_exc()}")
-                    # Actualizar estado de error
                     try:
-                        self._update_operation_status(message, "ERROR", error_message=str(e))
+                        if 'message' in locals():
+                            self._update_operation_status(message, "ERROR", error_message=str(e))
                     except:
                         pass
-                    # Pequeña pausa para prevenir ciclos de error
                     time.sleep(0.5)
 
         Logger.debug(f"Hilo trabajador {thread_name} finalizado")
 
-    def _process_in_order(self, message, priority, partition, thread_name):
+    def _process_deploy_slice_direct(self, message, thread_name):
         """
-        Procesa operaciones manteniendo orden FIFO por SliceId.
-
-        Args:
-            message: Mensaje a procesar
-            priority: Nivel de prioridad
-            partition: Número de partición
+        Procesa DEPLOY_SLICE directamente sin colas internas.
+        Cada worker procesa su operación de forma completamente independiente.
         """
+        operation_id = message.get('id')
         slice_id = message.get('payload', {}).get('slice_info', {}).get('id')
 
-        if not slice_id:
-            # Si no hay SliceId, procesar directamente
-            self._update_operation_status(message, "PROCESSING")
-            self._process_operation(message)
-            return
+        Logger.debug(f"🚀 {thread_name} procesando DEPLOY_SLICE {operation_id} (Slice {slice_id}) EN PARALELO COMPLETO")
 
-        # Adquirir lock para operaciones de este slice
-        with slice_queue_lock:
-            if slice_id not in slice_operation_queues:
-                slice_operation_queues[slice_id] = queue.Queue()
-                slice_operation_locks[slice_id] = threading.Lock()
-
-        # Añadir operación a la cola de este slice
-        slice_operation_queues[slice_id].put((message, thread_name))
-
-        # Intentar procesar cola de este slice (solo lo hará el primer thread que tome el lock)
-        if slice_operation_locks[slice_id].acquire(blocking=False):
-            try:
-                # Procesar todas las operaciones pendientes en orden
-                while not slice_operation_queues[slice_id].empty():
-                    try:
-                        next_operation, origin_thread = slice_operation_queues[slice_id].get(block=False)
-                        operation_id = next_operation.get('id')
-
-                        Logger.debug(
-                            f"🔍 Procesando operación {operation_id} (origen: {origin_thread}, procesador: {thread_name})")
-
-                        # CORRECCIÓN: Solo actualizar estado a PROCESSING para la primera operación
-                        # y solo por el thread que realmente procesará
-                        if origin_thread == thread_name:
-                            self._update_operation_status(next_operation, "PROCESSING")
-
-                        self._process_operation(next_operation)
-                        slice_operation_queues[slice_id].task_done()
-
-                    except queue.Empty:
-                        break
-                    except Exception as e:
-                        Logger.error(f"Error procesando operación para slice {slice_id}: {str(e)}")
-                        self._update_operation_status(next_operation, "ERROR", error_message=str(e))
-                        slice_operation_queues[slice_id].task_done()
-            finally:
-                # Liberar lock
-                slice_operation_locks[slice_id].release()
-
-                # Limpiar recursos si la cola está vacía
-                with slice_queue_lock:
-                    if slice_operation_queues[slice_id].empty():
-                        Logger.debug(f"🔍 Limpiando recursos para slice {slice_id}")
-                        del slice_operation_queues[slice_id]
-                        del slice_operation_locks[slice_id]
-
-    def _process_operation(self, message):
-        """
-        Procesa una operación según su tipo.
-
-        Args:
-            message: Mensaje con la operación a procesar
-        """
         try:
-            operation_type = message.get('operationType')
-            operation_id = message.get('id')
-
-            Logger.info(f"ℹ Procesando operación {operation_id} de tipo {operation_type}")
-
-            # Procesar según tipo de operación
-            if operation_type == "DEPLOY_SLICE":
-                self._process_deploy_slice(message)
-            else:
-                Logger.warning(f"Tipo de operación no implementado: {operation_type}")
-                self._update_operation_status(
-                    message,
-                    "ERROR",
-                    error_message=f"Tipo de operación no implementado: {operation_type}"
-                )
-
-        except Exception as e:
-            Logger.error(f"Error procesando operación {message.get('id')}: {str(e)}")
-            Logger.debug(f"Traceback: {traceback.format_exc()}")
-            self._update_operation_status(
-                message,
-                "ERROR",
-                error_message=str(e)
-            )
-            raise
-
-    def _process_deploy_slice(self, message):
-        """
-        Procesa una operación de despliegue de slice.
-
-        Args:
-            message: Mensaje con la operación de despliegue
-        """
-        try:
-            Logger.subsection(f"PROCESANDO DEPLOY_SLICE {message.get('id')}")
-
-            # Extraer payload
-            payload = message.get('payload', {})
-            if not payload:
-                raise ValueError("Payload vacío en mensaje de despliegue")
-
-            # Actualizar a IN_PROGRESS y notificar antes de empezar
-            Logger.info("ℹ Actualizando estado a IN_PROGRESS...")
-            self._update_operation_status(message, "PROCESSING")  # Esto se mapea a IN_PROGRESS en BD
-
-            # Notificar al Slice Manager que empezó el procesamiento
+            # Notificar progreso inicial
             try:
-                self._notify_slice_manager_progress(message, "IN_PROGRESS", "Iniciando despliegue de slice...")
+                self._notify_slice_manager_progress(message, "IN_PROGRESS", f"Iniciando despliegue en {thread_name}...")
             except Exception as e:
                 Logger.warning(f"Error notificando progreso: {str(e)}")
-                # No detenemos el despliegue por esto
 
-            # Ejecutar despliegue usando la lógica existente
-            Logger.info("ℹ Iniciando despliegue con SliceManager...")
+            # PROCESAR INMEDIATAMENTE - SIN BLOQUEOS
+            Logger.info(f"ℹ {thread_name} - Iniciando despliegue con SliceManager...")
+            payload = message.get('payload', {})
             deployed_config = self.slice_manager.deploy_slice(payload)
 
-            # Actualizar resultado en la base de datos ANTES del estado final
-            Logger.debug(f"🔍 Actualizando resultado de operación {message.get('id')}")
-            self._update_operation_result(message.get('id'), deployed_config)
-
-            # Actualizar estado final en base de datos
-            Logger.debug(f"🔍 Actualizando estado de operación {message.get('id')} a COMPLETED")
+            # Actualizar resultado y estado
+            self._update_operation_result(operation_id, deployed_config)
             self._update_operation_status(message, "COMPLETED")
 
-            # Notificar al Slice Manager
-            Logger.debug(f"🔍 Notificando resultado final al Slice Manager")
+            # Notificar éxito
             self._notify_slice_manager(message, "COMPLETED", deployed_config)
 
-            Logger.success(f"✓ Despliegue de slice {payload.get('slice_info', {}).get('id')} completado exitosamente")
+            Logger.success(f"✓ DEPLOY_SLICE {operation_id} completado por {thread_name}")
 
         except Exception as e:
-            Logger.error(f"Error en despliegue: {str(e)}")
-            # Limpiar recursos si es necesario
-            Logger.debug(f"🔍 Limpiando recursos para slice {payload.get('slice_info', {}).get('id', 'unknown')}")
+            Logger.error(f"Error en deploy directo: {str(e)}")
+            self._update_operation_status(message, "ERROR", error_message=str(e))
+            self._notify_slice_manager(message, "FAILED", error_message=str(e))
+            raise
+
+    def _process_stop_slice_direct(self, message, thread_name):
+        """
+        Procesa STOP_SLICE directamente.
+        """
+        operation_id = message.get('id')
+        slice_id = message.get('payload', {}).get('slice_info', {}).get('id')
+
+        Logger.debug(f"🛑 {thread_name} procesando STOP_SLICE {operation_id} (Slice {slice_id})")
+
+        try:
+            # Notificar progreso
+            self._notify_slice_manager_progress(message, "IN_PROGRESS", f"Deteniendo slice en {thread_name}...")
+
+            # Procesar directamente
+            payload = message.get('payload', {})
+            success, results = self.slice_manager.stop_slice(slice_id, payload)
+
+            if success:
+                self._update_operation_result(operation_id, results)
+                self._update_operation_status(message, "COMPLETED")
+                self._notify_slice_manager(message, "COMPLETED", results)
+                Logger.success(f"✓ STOP_SLICE {operation_id} completado por {thread_name}")
+            else:
+                error_msg = results.get('error', 'Error desconocido')
+                self._update_operation_status(message, "ERROR", error_message=error_msg)
+                self._notify_slice_manager(message, "FAILED", error_message=error_msg)
+
+        except Exception as e:
+            Logger.error(f"Error en stop directo: {str(e)}")
+            self._update_operation_status(message, "ERROR", error_message=str(e))
+            self._notify_slice_manager(message, "FAILED", error_message=str(e))
+            raise
+
+    def _process_restart_slice_direct(self, message, thread_name):
+        """
+        Procesa RESTART_SLICE directamente.
+        """
+        operation_id = message.get('id')
+        slice_id = message.get('payload', {}).get('slice_info', {}).get('id')
+
+        Logger.debug(f"🔄 {thread_name} procesando RESTART_SLICE {operation_id} (Slice {slice_id})")
+
+        try:
+            # Notificar progreso
+            self._notify_slice_manager_progress(message, "IN_PROGRESS", f"Reiniciando slice en {thread_name}...")
+
+            # Procesar directamente
+            payload = message.get('payload', {})
+            success, updated_vms = self.slice_manager.restart_slice(slice_id, payload)
+
+            if success:
+                result = {
+                    "slice_id": slice_id,
+                    "status": "running",
+                    "vms": updated_vms
+                }
+                self._update_operation_result(operation_id, result)
+                self._update_operation_status(message, "COMPLETED")
+                self._notify_slice_manager(message, "COMPLETED", result)
+                Logger.success(f"✓ RESTART_SLICE {operation_id} completado por {thread_name}")
+            else:
+                error_msg = "Error reiniciando VMs del slice"
+                self._update_operation_status(message, "ERROR", error_message=error_msg)
+                self._notify_slice_manager(message, "FAILED", error_message=error_msg)
+
+        except Exception as e:
+            Logger.error(f"Error en restart directo: {str(e)}")
             self._update_operation_status(message, "ERROR", error_message=str(e))
             self._notify_slice_manager(message, "FAILED", error_message=str(e))
             raise

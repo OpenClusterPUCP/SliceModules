@@ -164,7 +164,7 @@ def get_service_instance(service_name: str) -> dict:
         return None
 
 
-def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, priority="MEDIUM"):
+def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, priority=None):
     """
     Envía una solicitud al Queue Manager para encolar una operación.
 
@@ -174,7 +174,7 @@ def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, p
         zone_id (int): ID de la zona de disponibilidad
         user_id (int): ID del usuario
         payload (dict): Datos de la operación
-        priority (str): Prioridad (HIGH, MEDIUM, LOW)
+        priority (str, optional): Prioridad (HIGH, MEDIUM, LOW). Si es None, el Queue Manager la calculará
 
     Returns:
         dict: Respuesta del Queue Manager con el ID de operación
@@ -196,9 +196,15 @@ def enqueue_operation(operation_type, cluster_type, zone_id, user_id, payload, p
             "clusterType": cluster_type,
             "zoneId": zone_id,
             "userId": user_id,
-            "payload": payload,
-            "priority": priority
+            "payload": payload
         }
+
+        # Solo agregar priority si se especifica explícitamente
+        if priority is not None:
+            request_data["priority"] = priority
+            Logger.debug(f"Prioridad explícita especificada: {priority}")
+        else:
+            Logger.debug("Sin prioridad explícita - Queue Manager calculará automáticamente")
 
         # Enviar solicitud
         response = requests.post(
@@ -2563,8 +2569,8 @@ def deploy_slice():
                 cluster_type=cluster_type,
                 zone_id=zone_id,
                 user_id=user_id,
-                payload=json.loads(json.dumps(processed_config, default=json_handler)),
-                priority="HIGH"  # Consideramos deploy como alta prioridad
+                payload=json.loads(json.dumps(processed_config, default=json_handler))
+                # priority="HIGH" Consideramos deploy como alta prioridad
             )
 
             operation_id = queue_response.get("operationId")
